@@ -134,3 +134,4 @@ def get_session(room_name: str) -> BookingSession:
 
 def clear_session(room_name: str):
     _sessions.pop(room_name, None)
+#
