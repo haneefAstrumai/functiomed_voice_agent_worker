@@ -48,8 +48,9 @@ async def get_slots(service_name: str, doctor_name: str) -> list[dict]:
             resp = await client.get(
                 f"{RAG_BACKEND_URL}/clinic/slots",
                 params={
-                    "service_name": service_name,
-                    "doctor_name": doctor_name,
+                    # Backend expects these exact query param names for the agent path.
+                    "service": service_name,
+                    "doctor": doctor_name,
                     "available_only": True,
                 },
             )

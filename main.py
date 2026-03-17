@@ -13,7 +13,6 @@ load_dotenv()
 from livekit import agents
 from livekit.agents import AgentSession, Agent, ChatContext, ChatMessage, RoomInputOptions
 from livekit.plugins import openai, deepgram, silero
-from livekit.plugins.groq import LLM as GroqLLM
 from livekit.agents import function_tool, RunContext
 
 from booking.rag_client import retrieve_context, health_check
@@ -35,6 +34,15 @@ Your two responsibilities:
 1. Answer questions about the clinic using the knowledge injected into your context.
 2. Help patients book appointments using your booking tools.
 
+Critical voice constraints:
+- Never read out the retrieved context or quote long passages.
+- Keep answers very short (aim for <= 2 sentences / ~40 words) unless the user asks for details.
+- If you need to list options (services/doctors/slots), list only the top few and ask a follow-up question.
+
+Critical booking constraints:
+- For booking flows, use ONLY the booking tools (database-backed). Do not answer booking questions from retrieved context.
+- When the user expresses booking intent, immediately call get_services.
+
 Booking flow (follow this order strictly):
   1. get_services → confirm_service
   2. get_doctors  → confirm_doctor
@@ -55,6 +63,7 @@ Rules:
 class BookingState:
     def __init__(self):
         self.service:      str | None = None
+        # Store DB-matchable doctor name (doctors.full_name), without title prefixes.
         self.doctor:       str | None = None
         self.slot_id:      str | None = None
         self.slot_date:    str | None = None
@@ -69,9 +78,24 @@ class BookingState:
 # ── Agent ─────────────────────────────────────────────────────
 
 class FunctiomedAgent(Agent):
-    def __init__(self, chat_ctx: ChatContext) -> None:
+    def __init__(self, chat_ctx: ChatContext, mode: str = "rag") -> None:
         super().__init__(instructions=SYSTEM_PROMPT, chat_ctx=chat_ctx)
         self._booking = BookingState()
+        self._mode = (mode or "rag").strip().lower()
+
+    @property
+    def mode(self) -> str:
+        return self._mode
+
+    def _is_booking_intent(self, text: str) -> bool:
+        t = (text or "").lower()
+        return any(
+            kw in t
+            for kw in (
+                "book", "booking", "appointment", "schedule",
+                "termin", "buchen", "buchung",
+            )
+        )
 
     # ── RAG injection ─────────────────────────────────────────
 
@@ -82,6 +106,39 @@ class FunctiomedAgent(Agent):
     ) -> None:
         user_text = new_message.text_content or ""
 
+        # Mode lock: booking sessions never inject RAG; RAG sessions never initiate booking.
+        if self.mode == "booking":
+            # Booking-only: never inject RAG, even for non-booking utterances.
+            return
+        if self.mode == "rag" and self._is_booking_intent(user_text):
+            turn_ctx.add_message(
+                role="assistant",
+                content=(
+                    "I can answer clinic questions in this session. "
+                    "To book an appointment, please start a Booking session."
+                ),
+            )
+            return
+
+        # If the user is trying to book, do NOT inject RAG.
+        # Long retrieved context increases tool-calling failures and can exceed TTS limits.
+        booking_intent = self._is_booking_intent(user_text)
+        if booking_intent:
+            log.info("[RAG] Skipping — booking intent detected")
+
+            # Force the LLM to start the DB-backed booking flow immediately.
+            # (We still skip RAG injection here.)
+            if self._booking.step in ("idle", "done"):
+                self._booking.step = "idle"
+                turn_ctx.add_message(
+                    role="system",
+                    content=(
+                        "User wants to book an appointment. "
+                        "Immediately call the get_services tool, then ask the user to choose a service."
+                    ),
+                )
+            return
+
         if self._booking.step not in ("idle", "done"):
             log.info("[RAG] Skipping — booking in progress (step=%s)", self._booking.step)
             return
@@ -89,7 +146,8 @@ class FunctiomedAgent(Agent):
         context = await retrieve_context(user_text, top_k=5)
         if context:
             turn_ctx.add_message(
-                role="assistant",
+                # System message so it guides the LLM but is never treated as something to say aloud.
+                role="system",
                 content=f"[Clinic knowledge retrieved for this query]\n\n{context}",
             )
             log.info("[RAG] Injected %d chars of context", len(context))
@@ -103,6 +161,8 @@ class FunctiomedAgent(Agent):
     @function_tool()
     async def get_services(self, context: RunContext, dummy: str = "") -> str:
         """Get all available clinic services."""
+        if self.mode != "booking":
+            return "Booking is disabled in this session. Please start a Booking session."
         services = await get_services()
         if not services:
             return "No services are currently available."
@@ -113,6 +173,9 @@ class FunctiomedAgent(Agent):
     @function_tool()
     async def confirm_service(self, context: RunContext, service_name: str) -> str:
         """Confirm the service the patient wants to book."""
+        if self.mode != "booking":
+            return "Booking is disabled in this session. Please start a Booking session."
+        service_name = (service_name or "").strip()
         stored  = self._booking._services
         matched = next(
             (s for s in stored
@@ -120,7 +183,7 @@ class FunctiomedAgent(Agent):
              or service_name.lower() in s["name"].lower()),
             None
         )
-        exact_name            = matched["name"] if matched else service_name
+        exact_name            = (matched["name"] if matched else service_name).strip()
         self._booking.service = exact_name
         self._booking.step    = "service"
         return f"Service confirmed: {exact_name}. Let me find available doctors."
@@ -128,6 +191,8 @@ class FunctiomedAgent(Agent):
     @function_tool()
     async def get_doctors(self, context: RunContext, dummy: str = "") -> str:
         """Get doctors available for the selected service."""
+        if self.mode != "booking":
+            return "Booking is disabled in this session. Please start a Booking session."
         if not self._booking.service:
             return "Please select a service first."
         doctors = await get_doctors_for_service(self._booking.service)
@@ -145,6 +210,8 @@ class FunctiomedAgent(Agent):
     @function_tool()
     async def confirm_doctor(self, context: RunContext, doctor_name: str) -> str:
         """Confirm the doctor the patient wants to see."""
+        if self.mode != "booking":
+            return "Booking is disabled in this session. Please start a Booking session."
         stored  = self._booking._doctors
         matched = next(
             (d for d in stored
@@ -155,16 +222,22 @@ class FunctiomedAgent(Agent):
         if matched:
             title      = matched.get("title", "").strip()
             full_name  = matched["full_name"].strip()
-            exact_name = f"{title} {full_name}".strip() if title else full_name
+            # Display name can include title, but API/DB matching should use full_name only.
+            display_name = f"{title} {full_name}".strip() if title else full_name
+            db_name      = full_name
         else:
-            exact_name = doctor_name.strip()
-        self._booking.doctor = exact_name
+            display_name = doctor_name.strip()
+            db_name      = doctor_name.strip()
+
+        self._booking.doctor = db_name
         self._booking.step   = "doctor"
-        return f"Doctor confirmed: {exact_name}. Let me check available time slots."
+        return f"Doctor confirmed: {display_name}. Let me check available time slots."
 
     @function_tool()
     async def get_slots(self, context: RunContext, dummy: str = "") -> str:
         """Get available appointment slots for the selected service and doctor."""
+        if self.mode != "booking":
+            return "Booking is disabled in this session. Please start a Booking session."
         if not self._booking.service or not self._booking.doctor:
             return "Please select a service and doctor first."
         slots = await get_slots(self._booking.service, self._booking.doctor)
@@ -188,6 +261,8 @@ class FunctiomedAgent(Agent):
         slot_id: str,
     ) -> str:
         """Confirm the chosen slot. slot_id must be the UUID from get_slots, never a number."""
+        if self.mode != "booking":
+            return "Booking is disabled in this session. Please start a Booking session."
         stored_slots = self._booking._slots
 
         matched = next(
@@ -226,6 +301,8 @@ class FunctiomedAgent(Agent):
     @function_tool()
     async def confirm_name(self, context: RunContext, patient_name: str) -> str:
         """Confirm the patient's full name."""
+        if self.mode != "booking":
+            return "Booking is disabled in this session. Please start a Booking session."
         self._booking.patient_name = patient_name
         self._booking.step         = "name"
         b = self._booking
@@ -238,6 +315,8 @@ class FunctiomedAgent(Agent):
     @function_tool()
     async def save_appointment(self, context: RunContext, dummy: str = "") -> str:
         """Save the appointment after the patient confirms all details."""
+        if self.mode != "booking":
+            return "Booking is disabled in this session. Please start a Booking session."
         b = self._booking
 
         missing = [
@@ -290,15 +369,25 @@ async def entrypoint(ctx: agents.JobContext):
     await ctx.connect()
     log.info("Agent entered room: %s", ctx.room.name)
 
+    room_mode = "booking" if ctx.room.name.lower().endswith("-booking") else "rag"
+
     backend_ok = await health_check()
     if not backend_ok:
         log.warning("⚠️  Backend unreachable at %s", os.getenv("RAG_BACKEND_URL"))
 
+    # If running the OpenAI LLM plugin, ensure we never pass a Groq-only model name.
+    # LiveKit Cloud deployments often miss env vars; this keeps the agent from hard-failing with 404.
+    requested_model = (os.getenv("AGENT_LLM_MODEL") or "").strip()
+    openai_model = requested_model or "gpt-4o-mini"
+    if openai_model.startswith("llama-") or openai_model.startswith("mixtral") or openai_model.startswith("gemma"):
+        log.warning("AGENT_LLM_MODEL=%s is not an OpenAI model; falling back to gpt-4o-mini", openai_model)
+        openai_model = "gpt-4o-mini"
+
     session = AgentSession(
         stt=deepgram.STT(model="nova-2-general"),
-        llm=GroqLLM(
-            model=os.getenv("AGENT_LLM_MODEL", "llama-3.3-70b-versatile"),
-            api_key=os.getenv("GROQ_API_KEY"),
+        llm=openai.LLM(
+            model=openai_model,
+            api_key=os.getenv("OPENAI_API_KEY"),
         ),
         tts=openai.TTS(voice="alloy"),
         vad=silero.VAD.load(),
@@ -310,14 +399,34 @@ async def entrypoint(ctx: agents.JobContext):
         content="[System] Backend: " + ("online" if backend_ok else "offline"),
     )
 
+    # Booking mode: preload services from DB so the user immediately sees real options.
+    if room_mode == "booking":
+        try:
+            services = await get_services()
+            if services:
+                names = [s["name"] for s in services]
+                initial_ctx.add_message(
+                    role="assistant",
+                    content=(
+                        "Welcome to Functiomed booking. Which service would you like? "
+                        f"Available services: {', '.join(names[:8])}" + ("." if len(names) <= 8 else ", and more.")
+                    ),
+                )
+        except Exception as e:
+            log.error("Preload services failed: %s", e)
+
     await session.start(
         room=ctx.room,
-        agent=FunctiomedAgent(chat_ctx=initial_ctx),
+        agent=FunctiomedAgent(chat_ctx=initial_ctx, mode=room_mode),
         room_input_options=RoomInputOptions(noise_cancellation=True),
     )
 
     await session.generate_reply(
-        instructions="Greet the patient warmly in English and ask how you can help them today."
+        instructions=(
+            "Greet the patient warmly in English."
+            if room_mode == "booking"
+            else "Greet the patient warmly in English and ask how you can help them today."
+        )
     )
 
     log.info("Agent exiting room: %s", ctx.room.name)

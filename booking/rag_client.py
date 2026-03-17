@@ -18,6 +18,11 @@ RAG_BACKEND_URL = os.getenv("RAG_BACKEND_URL", "http://localhost:8000")
 RETRIEVE_TIMEOUT = 4.0   # seconds — keep low for voice latency
 TOP_K = 5                # chunks to inject into context
 
+# Voice agents must keep context small, otherwise the LLM tends to produce
+# long answers which can exceed TTS input limits.
+MAX_CONTEXT_CHARS = int(os.getenv("RAG_MAX_CONTEXT_CHARS", "1400"))
+MAX_CHUNK_CHARS = int(os.getenv("RAG_MAX_CHUNK_CHARS", "350"))
+
 
 async def retrieve_context(query: str, top_k: int = TOP_K) -> str:
     """
@@ -42,11 +47,19 @@ async def retrieve_context(query: str, top_k: int = TOP_K) -> str:
 
         # Format chunks for injection into chat context
         lines = ["Relevant clinic knowledge:"]
+        total = 0
         for r in results:
             source = r.get("page_name") or "clinic docs"
-            content = r.get("content", "").strip()
+            content = (r.get("content", "") or "").strip()
             if content:
-                lines.append(f"[{source}] {content}")
+                if len(content) > MAX_CHUNK_CHARS:
+                    content = content[: MAX_CHUNK_CHARS - 1].rstrip() + "…"
+                snippet = f"[{source}] {content}"
+                # Stop before exceeding global cap
+                if total + len(snippet) > MAX_CONTEXT_CHARS:
+                    break
+                lines.append(snippet)
+                total += len(snippet)
 
         return "\n\n".join(lines)
 
