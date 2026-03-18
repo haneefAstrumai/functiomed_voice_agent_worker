@@ -1,4 +1,3 @@
-
 """
 agent/main.py — Functiomed Voice Agent (Single LLM, Groq compatible)
 """
@@ -63,7 +62,6 @@ Rules:
 class BookingState:
     def __init__(self):
         self.service:      str | None = None
-        # Store DB-matchable doctor name (doctors.full_name), without title prefixes.
         self.doctor:       str | None = None
         self.slot_id:      str | None = None
         self.slot_date:    str | None = None
@@ -106,9 +104,7 @@ class FunctiomedAgent(Agent):
     ) -> None:
         user_text = new_message.text_content or ""
 
-        # Mode lock: booking sessions never inject RAG; RAG sessions never initiate booking.
         if self.mode == "booking":
-            # Booking-only: never inject RAG, even for non-booking utterances.
             return
         if self.mode == "rag" and self._is_booking_intent(user_text):
             turn_ctx.add_message(
@@ -120,14 +116,9 @@ class FunctiomedAgent(Agent):
             )
             return
 
-        # If the user is trying to book, do NOT inject RAG.
-        # Long retrieved context increases tool-calling failures and can exceed TTS limits.
         booking_intent = self._is_booking_intent(user_text)
         if booking_intent:
             log.info("[RAG] Skipping — booking intent detected")
-
-            # Force the LLM to start the DB-backed booking flow immediately.
-            # (We still skip RAG injection here.)
             if self._booking.step in ("idle", "done"):
                 self._booking.step = "idle"
                 turn_ctx.add_message(
@@ -146,7 +137,6 @@ class FunctiomedAgent(Agent):
         context = await retrieve_context(user_text, top_k=5)
         if context:
             turn_ctx.add_message(
-                # System message so it guides the LLM but is never treated as something to say aloud.
                 role="system",
                 content=f"[Clinic knowledge retrieved for this query]\n\n{context}",
             )
@@ -155,8 +145,6 @@ class FunctiomedAgent(Agent):
             log.info("[RAG] No context retrieved or backend unavailable")
 
     # ── Booking tools ─────────────────────────────────────────
-    # NOTE: Tools with no parameters must declare dummy: str = "" 
-    # to satisfy Groq's strict JSON schema (no empty required array)
 
     @function_tool()
     async def get_services(self, context: RunContext, dummy: str = "") -> str:
@@ -222,7 +210,6 @@ class FunctiomedAgent(Agent):
         if matched:
             title      = matched.get("title", "").strip()
             full_name  = matched["full_name"].strip()
-            # Display name can include title, but API/DB matching should use full_name only.
             display_name = f"{title} {full_name}".strip() if title else full_name
             db_name      = full_name
         else:
@@ -375,13 +362,36 @@ async def entrypoint(ctx: agents.JobContext):
     if not backend_ok:
         log.warning("⚠️  Backend unreachable at %s", os.getenv("RAG_BACKEND_URL"))
 
-    # If running the OpenAI LLM plugin, ensure we never pass a Groq-only model name.
-    # LiveKit Cloud deployments often miss env vars; this keeps the agent from hard-failing with 404.
     requested_model = (os.getenv("AGENT_LLM_MODEL") or "").strip()
     openai_model = requested_model or "gpt-4o-mini"
     if openai_model.startswith("llama-") or openai_model.startswith("mixtral") or openai_model.startswith("gemma"):
         log.warning("AGENT_LLM_MODEL=%s is not an OpenAI model; falling back to gpt-4o-mini", openai_model)
         openai_model = "gpt-4o-mini"
+
+    initial_ctx = ChatContext()
+    initial_ctx.add_message(
+        role="assistant",
+        content="[System] Backend: " + ("online" if backend_ok else "offline"),
+    )
+
+    # Booking mode: preload available services into context as a system hint,
+    # so the agent can naturally mention them in its opening greeting.
+    booking_services_hint = ""
+    if room_mode == "booking":
+        try:
+            services = await get_services()
+            if services:
+                names = [s["name"] for s in services]
+                booking_services_hint = (
+                    f"Available services: {', '.join(names[:8])}"
+                    + ("." if len(names) <= 8 else ", and more.")
+                )
+                initial_ctx.add_message(
+                    role="system",
+                    content=f"[Preloaded for this booking session] {booking_services_hint}",
+                )
+        except Exception as e:
+            log.error("Preload services failed: %s", e)
 
     session = AgentSession(
         stt=deepgram.STT(model="nova-2-general"),
@@ -393,41 +403,26 @@ async def entrypoint(ctx: agents.JobContext):
         vad=silero.VAD.load(),
     )
 
-    initial_ctx = ChatContext()
-    initial_ctx.add_message(
-        role="assistant",
-        content="[System] Backend: " + ("online" if backend_ok else "offline"),
-    )
-
-    # Booking mode: preload services from DB so the user immediately sees real options.
-    if room_mode == "booking":
-        try:
-            services = await get_services()
-            if services:
-                names = [s["name"] for s in services]
-                initial_ctx.add_message(
-                    role="assistant",
-                    content=(
-                        "Welcome to Functiomed booking. Which service would you like? "
-                        f"Available services: {', '.join(names[:8])}" + ("." if len(names) <= 8 else ", and more.")
-                    ),
-                )
-        except Exception as e:
-            log.error("Preload services failed: %s", e)
-
     await session.start(
         room=ctx.room,
         agent=FunctiomedAgent(chat_ctx=initial_ctx, mode=room_mode),
         room_input_options=RoomInputOptions(noise_cancellation=True),
     )
 
-    await session.generate_reply(
-        instructions=(
-            "Greet the patient warmly in English."
-            if room_mode == "booking"
-            else "Greet the patient warmly in English and ask how you can help them today."
+    # Both modes: always generate a spoken greeting so the patient hears the agent first.
+    if room_mode == "booking":
+        await session.generate_reply(
+            instructions=(
+                "Greet the patient warmly in English, introduce yourself as the Functiomed booking assistant, "
+                f"and ask which service they'd like to book. {booking_services_hint}"
+            )
         )
-    )
+    else:
+        await session.generate_reply(
+            instructions=(
+                "Greet the patient warmly in English and ask how you can help them today."
+            )
+        )
 
     log.info("Agent exiting room: %s", ctx.room.name)
 
