@@ -41,7 +41,9 @@ Critical voice constraints:
 
 Critical booking constraints:
 - For booking flows, use ONLY the booking tools (database-backed). Do not answer booking questions from retrieved context.
-- When the user expresses booking intent, immediately call get_services.
+- First message in booking mode must be only a greeting + "how can I assist you in booking?".
+- Do NOT list services in the first greeting.
+- Call get_services only when the user asks to book or asks about available services.
 
 Booking flow (follow this order strictly):
   1. get_services → confirm_service
@@ -437,25 +439,6 @@ async def entrypoint(ctx: agents.JobContext):
         content="[System] Backend: " + ("online" if backend_ok else "offline"),
     )
 
-    # Booking mode: preload available services into context as a system hint,
-    # so the agent can naturally mention them in its opening greeting.
-    booking_services_hint = ""
-    if room_mode == "booking":
-        try:
-            services = await get_services()
-            if services:
-                names = [s["name"] for s in services]
-                booking_services_hint = (
-                    f"Available services: {', '.join(names[:8])}"
-                    + ("." if len(names) <= 8 else ", and more.")
-                )
-                initial_ctx.add_message(
-                    role="system",
-                    content=f"[Preloaded for this booking session] {booking_services_hint}",
-                )
-        except Exception as e:
-            log.error("Preload services failed: %s", e)
-
     session = AgentSession(
         stt=deepgram.STT(model="nova-2-general"),
         llm=openai.LLM(
@@ -496,7 +479,8 @@ async def entrypoint(ctx: agents.JobContext):
         await session.generate_reply(
             instructions=(
                 "Greet the patient warmly in English, introduce yourself as the Functiomed booking assistant, "
-                f"and ask which service they'd like to book. {booking_services_hint}"
+                "and ask: how can I assist you in booking today? "
+                "Do not list any services unless the user asks to book or asks what services are available."
             )
         )
     else:
