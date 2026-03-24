@@ -6,6 +6,8 @@ import asyncio
 import json
 import logging
 import os
+import re
+from difflib import SequenceMatcher
 
 from dotenv import load_dotenv
 load_dotenv()
@@ -25,10 +27,32 @@ from booking.booking_client import (
 
 log = logging.getLogger(__name__)
 
-# ── System prompt ─────────────────────────────────────────────
+# ── System prompt builder ──────────────────────────────────────
 
-SYSTEM_PROMPT = """You are the friendly voice assistant for Functiomed, a medical clinic in Zurich.
+def build_system_prompt(lang: str) -> str:
+    """
+    Build a language-specific system prompt.
+    lang: 'en' | 'de'
+    """
+    if lang == "de":
+        language_instruction = (
+            "WICHTIG: Du sprichst AUSSCHLIESSLICH Deutsch in JEDER Antwort, ohne Ausnahme. "
+            "Wechsle niemals ins Englische, unabhängig davon, in welcher Sprache der Patient schreibt oder spricht. "
+            "Alle Begrüßungen, Bestätigungen, Fragen und Informationen sind auf Deutsch."
+        )
+        language_note = "Sprache: Deutsch (fest konfiguriert — kein Sprachwechsel erlaubt)"
+    else:
+        language_instruction = (
+            "IMPORTANT: You speak ONLY English in EVERY response, without exception. "
+            "Never switch to German or any other language, regardless of what language the patient uses. "
+            "All greetings, confirmations, questions, and information must be in English."
+        )
+        language_note = "Language: English (fixed — no language switching allowed)"
+
+    return f"""You are the friendly voice assistant for Functiomed, a medical clinic in Zurich.
 You speak naturally and concisely — this is a voice conversation, so keep answers short and clear.
+
+{language_instruction}
 
 Your two responsibilities:
 1. Answer questions about the clinic using the knowledge injected into your context.
@@ -41,18 +65,26 @@ Critical voice constraints:
 
 Critical booking constraints:
 - For booking flows, use ONLY the booking tools (database-backed). Do not answer booking questions from retrieved context.
-- First message in booking mode must be only a greeting + "how can I assist you in booking?".
+- First message in booking mode must be only a greeting + "how can I assist you in booking?" (in the configured language).
 - Do NOT list services in the first greeting.
 - Call get_services only when the user asks to book or asks about available services.
 
-Booking flow (follow this order strictly):
-  1. get_services → confirm_service
-  2. get_doctors  → confirm_doctor
-  3. get_slots    → confirm_slot (IMPORTANT: pass the exact slot_id UUID shown in the list)
-  4. confirm_name → save_appointment
+Booking flow — follow this EXACT order, never skip a step:
+  STEP 1: call get_services → present options → call confirm_service
+  STEP 2: call get_doctors  → present options → call confirm_doctor
+  STEP 3: call get_slots    → present options → call confirm_slot (pass exact slot_id UUID)
+  STEP 4: call confirm_name → call save_appointment
+
+CRITICAL tool ordering rules:
+- NEVER call get_slots before confirm_doctor has succeeded.
+- NEVER call get_doctors before confirm_service has succeeded.
+- NEVER call confirm_slot before get_slots has returned slot data.
+- NEVER call save_appointment before confirm_name has succeeded.
+- Each tool must complete successfully before moving to the next step.
+- If a tool returns an error, do NOT move to the next step — handle the error first.
 
 Rules:
-- Always start the conversation in English. Switch to German only if the user speaks German first.
+- {language_note}
 - Never make up clinic information. If context is missing, say you will check with the team.
 - Keep responses under 3 sentences for simple questions.
 - For booking, confirm each step before moving to the next.
@@ -79,15 +111,20 @@ class BookingState:
 # ── Agent ─────────────────────────────────────────────────────
 
 class FunctiomedAgent(Agent):
-    def __init__(self, chat_ctx: ChatContext, mode: str = "rag", room=None) -> None:
-        super().__init__(instructions=SYSTEM_PROMPT, chat_ctx=chat_ctx)
+    def __init__(self, chat_ctx: ChatContext, mode: str = "rag", lang: str = "en", room=None) -> None:
+        super().__init__(instructions=build_system_prompt(lang), chat_ctx=chat_ctx)
         self._booking = BookingState()
         self._mode = (mode or "rag").strip().lower()
+        self._lang = (lang or "en").strip().lower()
         self._room = room
 
     @property
     def mode(self) -> str:
         return self._mode
+
+    @property
+    def lang(self) -> str:
+        return self._lang
 
     def _is_booking_intent(self, text: str) -> bool:
         t = (text or "").lower()
@@ -98,6 +135,26 @@ class FunctiomedAgent(Agent):
                 "termin", "buchen", "buchung",
             )
         )
+
+    def _norm(self, s: str) -> str:
+        s = (s or "").strip().lower()
+        s = re.sub(r"[^a-z0-9\s]", " ", s)
+        s = re.sub(r"\s+", " ", s).strip()
+        return s
+
+    def _best_match(self, query: str, choices: list[str]) -> tuple[str | None, float]:
+        q = self._norm(query)
+        if not q or not choices:
+            return None, 0.0
+        best = (None, 0.0)
+        for c in choices:
+            c_norm = self._norm(c)
+            if not c_norm:
+                continue
+            score = SequenceMatcher(None, q, c_norm).ratio()
+            if score > best[1]:
+                best = (c, score)
+        return best
 
     async def _publish_state(self, ctx: RunContext, available: list | None = None) -> None:
         b = self._booking
@@ -143,13 +200,17 @@ class FunctiomedAgent(Agent):
         if self.mode == "booking":
             return
         if self.mode == "rag" and self._is_booking_intent(user_text):
-            turn_ctx.add_message(
-                role="assistant",
-                content=(
+            if self._lang == "de":
+                reply = (
+                    "Ich beantworte Fragen zur Klinik in dieser Sitzung. "
+                    "Um einen Termin zu buchen, starten Sie bitte eine Buchungs-Sitzung."
+                )
+            else:
+                reply = (
                     "I can answer clinic questions in this session. "
                     "To book an appointment, please start a Booking session."
-                ),
-            )
+                )
+            turn_ctx.add_message(role="assistant", content=reply)
             return
 
         booking_intent = self._is_booking_intent(user_text)
@@ -157,13 +218,17 @@ class FunctiomedAgent(Agent):
             log.info("[RAG] Skipping — booking intent detected")
             if self._booking.step in ("idle", "done"):
                 self._booking.step = "idle"
-                turn_ctx.add_message(
-                    role="system",
-                    content=(
+                if self._lang == "de":
+                    instr = (
+                        "Der Patient möchte einen Termin buchen. "
+                        "Rufe sofort das get_services-Tool auf und frage den Patienten dann, welchen Service er möchte."
+                    )
+                else:
+                    instr = (
                         "User wants to book an appointment. "
                         "Immediately call the get_services tool, then ask the user to choose a service."
-                    ),
-                )
+                    )
+                turn_ctx.add_message(role="system", content=instr)
             return
 
         if self._booking.step not in ("idle", "done"):
@@ -184,46 +249,96 @@ class FunctiomedAgent(Agent):
 
     @function_tool()
     async def get_services(self, context: RunContext, dummy: str = "") -> str:
-        """Get all available clinic services."""
+        """Get all available clinic services. Call this when the user wants to book."""
         if self.mode != "booking":
+            if self._lang == "de":
+                return "Buchungen sind in dieser Sitzung deaktiviert. Bitte starten Sie eine Buchungs-Sitzung."
             return "Booking is disabled in this session. Please start a Booking session."
-        services = await get_services()
+        log.info("[GET_SERVICES] fetching services from backend")
+        try:
+            services = await get_services()
+        except Exception as e:
+            log.error("[GET_SERVICES] backend exception: %s", e)
+            if self._lang == "de":
+                return "Es gab einen technischen Fehler. Bitte versuchen Sie es erneut."
+            return "There was a technical error fetching services. Please try again."
         if not services:
+            log.warning("[GET_SERVICES] backend returned no services")
+            if self._lang == "de":
+                return "Derzeit sind keine Leistungen verfügbar."
             return "No services are currently available."
         self._booking._services = services
         self._booking.step = "collect_service"
         names = [s["name"] for s in services]
+        log.info("[GET_SERVICES] returning %d services: %s", len(names), names)
         await self._publish_state(context, available=names)
         return f"Available services: {', '.join(names)}"
 
     @function_tool()
     async def confirm_service(self, context: RunContext, service_name: str) -> str:
-        """Confirm the service the patient wants to book."""
+        """Confirm the service the patient wants. Must be called after get_services."""
         if self.mode != "booking":
+            if self._lang == "de":
+                return "Buchungen sind in dieser Sitzung deaktiviert. Bitte starten Sie eine Buchungs-Sitzung."
             return "Booking is disabled in this session. Please start a Booking session."
         service_name = (service_name or "").strip()
-        stored  = self._booking._services
-        matched = next(
-            (s for s in stored
-             if s["name"].lower() == service_name.lower()
-             or service_name.lower() in s["name"].lower()),
-            None
-        )
-        exact_name            = (matched["name"] if matched else service_name).strip()
+        stored = self._booking._services
+        log.info("[CONFIRM_SERVICE] received=%r stored_count=%d", service_name, len(stored))
+        choices = [s.get("name", "").strip() for s in stored if s.get("name")]
+        direct = next((c for c in choices if self._norm(c) == self._norm(service_name)), None)
+        if direct:
+            exact_name = direct
+        else:
+            best, score = self._best_match(service_name, choices)
+            log.info("[CONFIRM_SERVICE] best_match=%r score=%.3f", best, score)
+            if best and score >= 0.72:
+                exact_name = best
+            else:
+                self._booking.step = "collect_service"
+                await self._publish_state(context, available=choices[:10])
+                log.warning("[CONFIRM_SERVICE] no match for %r — re-asking", service_name)
+                if self._lang == "de":
+                    return (
+                        f"Ich habe verstanden: {service_name}. "
+                        "Könnten Sie den Servicenamen wiederholen oder aus den Optionen in der Seitenleiste wählen?"
+                    )
+                return (
+                    f"I heard: {service_name}. "
+                    "Could you repeat the service name, or choose from the options in the sidebar?"
+                )
+
         self._booking.service = exact_name
         self._booking.step    = "service"
+        log.info("[CONFIRM_SERVICE] stored service=%r step=service", exact_name)
         await self._publish_state(context)
+        if self._lang == "de":
+            return f"Service bestätigt: {exact_name}. Ich suche jetzt nach verfügbaren Ärzten."
         return f"Service confirmed: {exact_name}. Let me find available doctors."
 
     @function_tool()
     async def get_doctors(self, context: RunContext, dummy: str = "") -> str:
-        """Get doctors available for the selected service."""
+        """Get doctors available for the confirmed service. Call after confirm_service."""
         if self.mode != "booking":
+            if self._lang == "de":
+                return "Buchungen sind in dieser Sitzung deaktiviert. Bitte starten Sie eine Buchungs-Sitzung."
             return "Booking is disabled in this session. Please start a Booking session."
+        log.info("[GET_DOCTORS] service=%r", self._booking.service)
         if not self._booking.service:
+            log.error("[GET_DOCTORS] GUARD HIT — service is None")
+            if self._lang == "de":
+                return "Bitte wählen Sie zuerst einen Service aus."
             return "Please select a service first."
-        doctors = await get_doctors_for_service(self._booking.service)
+        try:
+            doctors = await get_doctors_for_service(self._booking.service)
+        except Exception as e:
+            log.error("[GET_DOCTORS] backend exception: %s", e)
+            if self._lang == "de":
+                return "Es gab einen technischen Fehler beim Abrufen der Ärzte. Bitte versuchen Sie es erneut."
+            return "There was a technical error fetching doctors. Please try again."
         if not doctors:
+            log.warning("[GET_DOCTORS] no doctors for service=%r", self._booking.service)
+            if self._lang == "de":
+                return f"Für {self._booking.service} sind keine Ärzte verfügbar."
             return f"No doctors available for {self._booking.service}."
         self._booking._doctors = doctors
         lines = []
@@ -232,51 +347,113 @@ class FunctiomedAgent(Agent):
             name    = d.get("full_name", "").strip()
             display = f"{title} {name}".strip() if title else name
             lines.append(display)
+        log.info("[GET_DOCTORS] returning %d doctors: %s", len(lines), lines)
         await self._publish_state(context, available=lines)
         return f"Available doctors: {', '.join(lines)}"
 
     @function_tool()
     async def confirm_doctor(self, context: RunContext, doctor_name: str) -> str:
-        """Confirm the doctor the patient wants to see."""
+        """Confirm the doctor the patient wants to see. Must be called before get_slots."""
         if self.mode != "booking":
+            if self._lang == "de":
+                return "Buchungen sind in dieser Sitzung deaktiviert. Bitte starten Sie eine Buchungs-Sitzung."
             return "Booking is disabled in this session. Please start a Booking session."
-        stored  = self._booking._doctors
-        matched = next(
-            (d for d in stored
-             if doctor_name.lower() in d.get("full_name", "").lower()
-             or d.get("full_name", "").lower() in doctor_name.lower()),
-            None
-        )
-        if matched:
-            title      = matched.get("title", "").strip()
-            full_name  = matched["full_name"].strip()
-            display_name = f"{title} {full_name}".strip() if title else full_name
-            db_name      = full_name
-        else:
-            display_name = doctor_name.strip()
-            db_name      = doctor_name.strip()
 
-        self._booking.doctor = db_name
+        stored = self._booking._doctors
+        log.info("[CONFIRM_DOCTOR] received=%r stored_count=%d service=%r",
+                 doctor_name, len(stored), self._booking.service)
+
+        choices = []
+        for d in stored:
+            title = (d.get("title") or "").strip()
+            full = (d.get("full_name") or "").strip()
+            if not full:
+                continue
+            display = f"{title} {full}".strip() if title else full
+            choices.append(display)
+
+        log.info("[CONFIRM_DOCTOR] choices=%s", choices)
+
+        best, score = self._best_match(doctor_name, choices)
+        log.info("[CONFIRM_DOCTOR] best_match=%r score=%.3f", best, score)
+
+        if best and score >= 0.72:
+            # Store the full display name (e.g. "Dr. Müller") — this is what
+            # the backend /clinic/slots endpoint expects for doctor filtering.
+            display_name = best
+        else:
+            self._booking.step = "collect_doctor"
+            await self._publish_state(context, available=choices[:10])
+            log.warning("[CONFIRM_DOCTOR] no match for %r — re-asking", doctor_name)
+            if self._lang == "de":
+                return (
+                    f"Ich habe verstanden: {doctor_name}. "
+                    "Könnten Sie den Namen des Arztes wiederholen oder aus den Optionen in der Seitenleiste wählen?"
+                )
+            return (
+                f"I heard: {doctor_name}. "
+                "Could you repeat the doctor name, or choose from the options in the sidebar?"
+            )
+
+        # Store display_name (full title + name) so get_slots can pass it to the backend
+        self._booking.doctor = display_name
         self._booking.step   = "doctor"
+        log.info("[CONFIRM_DOCTOR] stored doctor=%r step=doctor", self._booking.doctor)
         await self._publish_state(context)
+        if self._lang == "de":
+            return f"Arzt bestätigt: {display_name}. Ich prüfe jetzt die verfügbaren Termine."
         return f"Doctor confirmed: {display_name}. Let me check available time slots."
 
     @function_tool()
     async def get_slots(self, context: RunContext, dummy: str = "") -> str:
-        """Get available appointment slots for the selected service and doctor."""
+        """Get available appointment slots. Only call this AFTER confirm_doctor has been called."""
         if self.mode != "booking":
+            if self._lang == "de":
+                return "Buchungen sind in dieser Sitzung deaktiviert. Bitte starten Sie eine Buchungs-Sitzung."
             return "Booking is disabled in this session. Please start a Booking session."
-        if not self._booking.service or not self._booking.doctor:
-            return "Please select a service and doctor first."
-        slots = await get_slots(self._booking.service, self._booking.doctor)
+
+        log.info("[GET_SLOTS] service=%r doctor=%r step=%r",
+                 self._booking.service, self._booking.doctor, self._booking.step)
+
+        if not self._booking.service:
+            log.error("[GET_SLOTS] GUARD HIT — service is None, step=%r", self._booking.step)
+            if self._lang == "de":
+                return "Bitte wählen Sie zuerst einen Service aus."
+            return "Service not selected yet. Please call confirm_service first."
+
+        if not self._booking.doctor:
+            log.error("[GET_SLOTS] GUARD HIT — doctor is None, step=%r. "
+                      "confirm_doctor must be called before get_slots.", self._booking.step)
+            if self._lang == "de":
+                return "Bitte wählen Sie zuerst einen Arzt aus."
+            return "Doctor not selected yet. Please call confirm_doctor first."
+
+        log.info("[GET_SLOTS] calling backend: service=%r doctor=%r",
+                 self._booking.service, self._booking.doctor)
+        try:
+            slots = await get_slots(self._booking.service, self._booking.doctor)
+        except Exception as e:
+            log.error("[GET_SLOTS] backend exception: %s", e)
+            if self._lang == "de":
+                return "Es gab einen technischen Fehler beim Abrufen der Termine. Bitte versuchen Sie es erneut."
+            return "There was a technical error fetching slots. Please try again."
+
+        log.info("[GET_SLOTS] backend returned %d slots", len(slots) if slots else 0)
+
         if not slots:
+            log.warning("[GET_SLOTS] no slots returned for service=%r doctor=%r",
+                        self._booking.service, self._booking.doctor)
+            if self._lang == "de":
+                return "Derzeit sind keine Termine verfügbar. Bitte rufen Sie die Klinik direkt an."
             return "No available slots at this time. Please call the clinic directly."
+
         self._booking._slots = slots
         lines = []
         for i, s in enumerate(slots[:5], 1):
             lines.append(f"{i}. {s['slot_date']} at {s['slot_time']} — slot_id: {s['id']}")
         slot_labels = [f"{s['slot_date']} at {s['slot_time']}" for s in slots[:5]]
         await self._publish_state(context, available=slot_labels)
+        log.info("[GET_SLOTS] returning %d slots to LLM", len(lines))
         return (
             "Available slots:\n" + "\n".join(lines) +
             "\n\nWhen confirming, pass the exact slot_id UUID shown above."
@@ -292,6 +469,8 @@ class FunctiomedAgent(Agent):
     ) -> str:
         """Confirm the chosen slot. slot_id must be the UUID from get_slots, never a number."""
         if self.mode != "booking":
+            if self._lang == "de":
+                return "Buchungen sind in dieser Sitzung deaktiviert. Bitte starten Sie eine Buchungs-Sitzung."
             return "Booking is disabled in this session. Please start a Booking session."
         stored_slots = self._booking._slots
 
@@ -317,6 +496,8 @@ class FunctiomedAgent(Agent):
                 f"  {s['slot_date']} at {s['slot_time']} (slot_id: {s['id']})"
                 for s in stored_slots[:5]
             )
+            if self._lang == "de":
+                return f"Ich konnte diesen Termin nicht finden. Bitte wählen Sie aus:\n{slots_available}"
             return f"I couldn't find that slot. Please choose from:\n{slots_available}"
 
         self._booking.slot_id   = matched["id"]
@@ -324,6 +505,11 @@ class FunctiomedAgent(Agent):
         self._booking.slot_time = matched["slot_time"]
         self._booking.step      = "slot"
         await self._publish_state(context)
+        if self._lang == "de":
+            return (
+                f"Termin bestätigt: {matched['slot_date']} um {matched['slot_time']}. "
+                "Darf ich Ihren vollständigen Namen für die Buchung erfahren?"
+            )
         return (
             f"Slot confirmed: {matched['slot_date']} at {matched['slot_time']}. "
             "May I have your full name to complete the booking?"
@@ -333,14 +519,26 @@ class FunctiomedAgent(Agent):
     async def confirm_name(self, context: RunContext, patient_name: str) -> str:
         """Confirm the patient's full name."""
         if self.mode != "booking":
+            if self._lang == "de":
+                return "Buchungen sind in dieser Sitzung deaktiviert. Bitte starten Sie eine Buchungs-Sitzung."
             return "Booking is disabled in this session. Please start a Booking session."
         self._booking.patient_name = patient_name
         self._booking.step         = "name"
         await self._publish_state(context)
         b = self._booking
+        if self._lang == "de":
+            return (
+                f"Danke. Ich habe Ihren Namen als: {patient_name} verstanden. "
+                "Falls die Schreibweise nicht korrekt ist, buchstabieren Sie bitte Ihren vollständigen Namen langsam (Buchstabe für Buchstabe). "
+                f"Andernfalls hier die Buchungszusammenfassung: {b.service} mit {b.doctor} "
+                f"am {b.slot_date} um {b.slot_time}. "
+                "Soll ich diesen Termin bestätigen?"
+            )
         return (
-            f"Let me confirm: {b.service} with {b.doctor} "
-            f"on {b.slot_date} at {b.slot_time} for {patient_name}. "
+            f"Thanks. I heard your name as: {patient_name}. "
+            "If the spelling is not correct, please spell your full name slowly (letter by letter). "
+            f"Otherwise, here is the full booking summary: {b.service} with {b.doctor} "
+            f"on {b.slot_date} at {b.slot_time}. "
             "Shall I confirm this appointment?"
         )
 
@@ -348,6 +546,8 @@ class FunctiomedAgent(Agent):
     async def save_appointment(self, context: RunContext, dummy: str = "") -> str:
         """Save the appointment after the patient confirms all details."""
         if self.mode != "booking":
+            if self._lang == "de":
+                return "Buchungen sind in dieser Sitzung deaktiviert. Bitte starten Sie eine Buchungs-Sitzung."
             return "Booking is disabled in this session. Please start a Booking session."
         b = self._booking
 
@@ -361,6 +561,12 @@ class FunctiomedAgent(Agent):
         ]
         if missing:
             log.error("[SAVE] Missing fields: %s", missing)
+            if self._lang == "de":
+                return (
+                    f"Es fehlen noch einige Angaben: {', '.join(missing)}. "
+                    + ("Welchen Termin möchten Sie?" if "slot_id" in missing
+                       else "Könnten Sie Ihren Namen wiederholen?")
+                )
             return (
                 f"I'm missing some details: {', '.join(missing)}. "
                 + ("Which slot would you like?" if "slot_id" in missing
@@ -404,6 +610,12 @@ class FunctiomedAgent(Agent):
             except Exception as e:
                 log.error("[STATE] Failed to publish done state: %s", e)
             self._booking = BookingState()
+            if self._lang == "de":
+                return (
+                    f"Ihr Termin ist bestätigt! "
+                    f"Bestätigungsnummer: {conf}. "
+                    "Wir freuen uns darauf, Sie bei Functiomed zu sehen."
+                )
             return (
                 f"Your appointment is confirmed! "
                 f"Confirmation number: {conf}. "
@@ -411,6 +623,8 @@ class FunctiomedAgent(Agent):
             )
 
         log.error("[SAVE] Backend returned no confirmation: %s", result)
+        if self._lang == "de":
+            return "Bei der Speicherung Ihrer Buchung ist ein Problem aufgetreten. Bitte rufen Sie die Klinik direkt an."
         return "There was a problem saving your booking. Please call the clinic directly."
 
 
@@ -421,7 +635,18 @@ async def entrypoint(ctx: agents.JobContext):
     await ctx.connect()
     log.info("Agent entered room: %s", ctx.room.name)
 
-    room_mode = "booking" if ctx.room.name.lower().endswith("-booking") else "rag"
+    room_name = (ctx.room.name or "").lower()
+    room_parts = room_name.split("-")
+    room_mode = "booking" if "booking" in room_parts else "rag"
+
+    # Language is always 'en' or 'de' — no more 'auto'
+    room_lang = "en"
+    if "de" in room_parts:
+        room_lang = "de"
+    elif "en" in room_parts:
+        room_lang = "en"
+
+    log.info("[ROOM] mode=%s lang=%s room=%s", room_mode, room_lang, room_name)
 
     backend_ok = await health_check()
     if not backend_ok:
@@ -439,8 +664,19 @@ async def entrypoint(ctx: agents.JobContext):
         content="[System] Backend: " + ("online" if backend_ok else "offline"),
     )
 
+    # STT: always pin the language — no auto-detect
+    stt_kwargs = {
+        "model": "nova-2-general",
+        "interim_results": True,
+        "punctuate": True,
+        "smart_format": True,
+        "language": room_lang,  # always 'en' or 'de'
+    }
+
+    log.info("[STT] mode=%s language=%s config=%s", room_mode, room_lang, stt_kwargs)
+
     session = AgentSession(
-        stt=deepgram.STT(model="nova-2-general"),
+        stt=deepgram.STT(**stt_kwargs),
         llm=openai.LLM(
             model=openai_model,
             api_key=os.getenv("OPENAI_API_KEY"),
@@ -451,7 +687,7 @@ async def entrypoint(ctx: agents.JobContext):
 
     await session.start(
         room=ctx.room,
-        agent=FunctiomedAgent(chat_ctx=initial_ctx, mode=room_mode, room=ctx.room),
+        agent=FunctiomedAgent(chat_ctx=initial_ctx, mode=room_mode, lang=room_lang, room=ctx.room),
         room_input_options=RoomInputOptions(noise_cancellation=True),
     )
 
@@ -474,21 +710,31 @@ async def entrypoint(ctx: agents.JobContext):
         except Exception as e:
             log.error("[STATE] Failed to publish initial idle state: %s", e)
 
-    # Both modes: always generate a spoken greeting so the patient hears the agent first.
+    # Greeting in the correct language
     if room_mode == "booking":
-        await session.generate_reply(
-            instructions=(
+        if room_lang == "de":
+            greeting_instructions = (
+                "Begrüße den Patienten herzlich auf Deutsch, stelle dich als Buchungsassistent von Functiomed vor "
+                "und frage: Wie kann ich Ihnen heute bei der Terminbuchung helfen? "
+                "Liste keine Leistungen auf, es sei denn, der Patient fragt danach."
+            )
+        else:
+            greeting_instructions = (
                 "Greet the patient warmly in English, introduce yourself as the Functiomed booking assistant, "
                 "and ask: how can I assist you in booking today? "
                 "Do not list any services unless the user asks to book or asks what services are available."
             )
-        )
     else:
-        await session.generate_reply(
-            instructions=(
+        if room_lang == "de":
+            greeting_instructions = (
+                "Begrüße den Patienten herzlich auf Deutsch und frage, wie du ihm heute helfen kannst."
+            )
+        else:
+            greeting_instructions = (
                 "Greet the patient warmly in English and ask how you can help them today."
             )
-        )
+
+    await session.generate_reply(instructions=greeting_instructions)
 
     log.info("Agent exiting room: %s", ctx.room.name)
 
