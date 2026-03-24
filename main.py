@@ -3,6 +3,7 @@ agent/main.py — Functiomed Voice Agent (Single LLM, Groq compatible)
 """
 
 import asyncio
+import json
 import logging
 import os
 
@@ -76,10 +77,11 @@ class BookingState:
 # ── Agent ─────────────────────────────────────────────────────
 
 class FunctiomedAgent(Agent):
-    def __init__(self, chat_ctx: ChatContext, mode: str = "rag") -> None:
+    def __init__(self, chat_ctx: ChatContext, mode: str = "rag", room=None) -> None:
         super().__init__(instructions=SYSTEM_PROMPT, chat_ctx=chat_ctx)
         self._booking = BookingState()
         self._mode = (mode or "rag").strip().lower()
+        self._room = room
 
     @property
     def mode(self) -> str:
@@ -94,6 +96,38 @@ class FunctiomedAgent(Agent):
                 "termin", "buchen", "buchung",
             )
         )
+
+    async def _publish_state(self, ctx: RunContext, available: list | None = None) -> None:
+        b = self._booking
+        step_map = {
+            "idle": "idle",
+            "collect_service": "collect_service",
+            "service": "collect_doctor",
+            "doctor": "collect_slot",
+            "slot": "collect_name",
+            "name": "confirm",
+            "done": "done",
+        }
+        payload = {
+            "type": "booking_update",
+            "step": step_map.get(b.step, "idle"),
+            "data": {
+                "service": b.service,
+                "doctor": b.doctor,
+                "slot": f"{b.slot_date} {b.slot_time}".strip() if b.slot_date and b.slot_time else None,
+                "name": b.patient_name,
+            },
+            "available": available or [],
+        }
+        try:
+            if not self._room:
+                raise RuntimeError("Room is unavailable for booking state publish")
+            await self._room.local_participant.publish_data(
+                json.dumps(payload).encode(),
+                reliable=True,
+            )
+        except Exception as e:
+            log.error("[STATE] Failed to publish booking_update: %s", e)
 
     # ── RAG injection ─────────────────────────────────────────
 
@@ -155,7 +189,9 @@ class FunctiomedAgent(Agent):
         if not services:
             return "No services are currently available."
         self._booking._services = services
+        self._booking.step = "collect_service"
         names = [s["name"] for s in services]
+        await self._publish_state(context, available=names)
         return f"Available services: {', '.join(names)}"
 
     @function_tool()
@@ -174,6 +210,7 @@ class FunctiomedAgent(Agent):
         exact_name            = (matched["name"] if matched else service_name).strip()
         self._booking.service = exact_name
         self._booking.step    = "service"
+        await self._publish_state(context)
         return f"Service confirmed: {exact_name}. Let me find available doctors."
 
     @function_tool()
@@ -193,6 +230,7 @@ class FunctiomedAgent(Agent):
             name    = d.get("full_name", "").strip()
             display = f"{title} {name}".strip() if title else name
             lines.append(display)
+        await self._publish_state(context, available=lines)
         return f"Available doctors: {', '.join(lines)}"
 
     @function_tool()
@@ -218,6 +256,7 @@ class FunctiomedAgent(Agent):
 
         self._booking.doctor = db_name
         self._booking.step   = "doctor"
+        await self._publish_state(context)
         return f"Doctor confirmed: {display_name}. Let me check available time slots."
 
     @function_tool()
@@ -234,6 +273,8 @@ class FunctiomedAgent(Agent):
         lines = []
         for i, s in enumerate(slots[:5], 1):
             lines.append(f"{i}. {s['slot_date']} at {s['slot_time']} — slot_id: {s['id']}")
+        slot_labels = [f"{s['slot_date']} at {s['slot_time']}" for s in slots[:5]]
+        await self._publish_state(context, available=slot_labels)
         return (
             "Available slots:\n" + "\n".join(lines) +
             "\n\nWhen confirming, pass the exact slot_id UUID shown above."
@@ -280,6 +321,7 @@ class FunctiomedAgent(Agent):
         self._booking.slot_date = matched["slot_date"]
         self._booking.slot_time = matched["slot_time"]
         self._booking.step      = "slot"
+        await self._publish_state(context)
         return (
             f"Slot confirmed: {matched['slot_date']} at {matched['slot_time']}. "
             "May I have your full name to complete the booking?"
@@ -292,6 +334,7 @@ class FunctiomedAgent(Agent):
             return "Booking is disabled in this session. Please start a Booking session."
         self._booking.patient_name = patient_name
         self._booking.step         = "name"
+        await self._publish_state(context)
         b = self._booking
         return (
             f"Let me confirm: {b.service} with {b.doctor} "
@@ -338,6 +381,26 @@ class FunctiomedAgent(Agent):
         conf    = booking.get("confirmation_number")
 
         if conf:
+            try:
+                if not self._room:
+                    raise RuntimeError("Room is unavailable for booking done publish")
+                await self._room.local_participant.publish_data(
+                    json.dumps({
+                        "type": "booking_update",
+                        "step": "done",
+                        "data": {
+                            "service": b.service,
+                            "doctor": b.doctor,
+                            "slot": f"{b.slot_date} {b.slot_time}".strip() if b.slot_date and b.slot_time else None,
+                            "name": b.patient_name,
+                            "confirmation": conf,
+                        },
+                        "available": [],
+                    }).encode(),
+                    reliable=True,
+                )
+            except Exception as e:
+                log.error("[STATE] Failed to publish done state: %s", e)
             self._booking = BookingState()
             return (
                 f"Your appointment is confirmed! "
@@ -405,9 +468,28 @@ async def entrypoint(ctx: agents.JobContext):
 
     await session.start(
         room=ctx.room,
-        agent=FunctiomedAgent(chat_ctx=initial_ctx, mode=room_mode),
+        agent=FunctiomedAgent(chat_ctx=initial_ctx, mode=room_mode, room=ctx.room),
         room_input_options=RoomInputOptions(noise_cancellation=True),
     )
+
+    if room_mode == "booking":
+        try:
+            await ctx.room.local_participant.publish_data(
+                json.dumps({
+                    "type": "booking_update",
+                    "step": "idle",
+                    "data": {
+                        "service": None,
+                        "doctor": None,
+                        "slot": None,
+                        "name": None,
+                    },
+                    "available": [],
+                }).encode(),
+                reliable=True,
+            )
+        except Exception as e:
+            log.error("[STATE] Failed to publish initial idle state: %s", e)
 
     # Both modes: always generate a spoken greeting so the patient hears the agent first.
     if room_mode == "booking":
