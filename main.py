@@ -63,6 +63,16 @@ _NEGATIVE_DE = {
     "nicht", "ändern", "warte", "moment",
 }
 
+_CANCEL_EN = {
+    "cancel", "cancel booking", "stop booking", "abort", "do not confirm",
+    "don't confirm", "do not proceed", "stop", "cancel it",
+}
+
+_CANCEL_DE = {
+    "abbrechen", "buchung abbrechen", "stornieren", "nicht bestätigen",
+    "nicht fortfahren", "stop", "stopp",
+}
+
 
 def _is_affirmative(text: str, lang: str) -> bool:
     t = (text or "").lower().strip()
@@ -83,6 +93,18 @@ def _is_negative(text: str, lang: str) -> bool:
     t = re.sub(r"[^\w\s]", " ", t)
     words = set(t.split())
     pool = _NEGATIVE_DE if lang == "de" else _NEGATIVE_EN
+    if words & pool:
+        return True
+    for phrase in pool:
+        if " " in phrase and phrase in t:
+            return True
+    return False
+
+def _is_cancel_intent(text: str, lang: str) -> bool:
+    t = (text or "").lower().strip()
+    t = re.sub(r"[^\w\s]", " ", t)
+    words = set(t.split())
+    pool = _CANCEL_DE if lang == "de" else _CANCEL_EN
     if words & pool:
         return True
     for phrase in pool:
@@ -269,6 +291,23 @@ class FunctiomedAgent(Agent):
         except Exception as e:
             log.error("[STATE] Failed to publish booking_update: %s", e)
 
+    async def _publish_cancelled_state(self) -> None:
+        payload = {
+            "type": "booking_update",
+            "step": "cancelled",
+            "data": {"service": None, "doctor": None, "slot": None, "name": None},
+            "available": [],
+        }
+        try:
+            if not self._room:
+                raise RuntimeError("Room unavailable for cancelled-state publish")
+            await self._room.local_participant.publish_data(
+                json.dumps(payload).encode(),
+                reliable=True,
+            )
+        except Exception as e:
+            log.error("[STATE] Failed to publish cancelled state: %s", e)
+
     # ── RAG injection ─────────────────────────────────────────
 
     async def on_user_turn_completed(
@@ -289,12 +328,16 @@ class FunctiomedAgent(Agent):
                     "The patient has confirmed the booking. Call the confirm_booking tool now."
                 )
             elif _is_negative(user_text, self._lang):
+                self._booking.step = "awaiting_cancel_or_change"
                 instr = (
-                    "Der Patient möchte etwas ändern. Frage ihn, was er ändern möchte "
-                    "(Service, Arzt, Termin oder Name), und gehe zum entsprechenden Schritt zurück."
+                    "Der Patient hat die Zusammenfassung nicht bestätigt. "
+                    "Frage jetzt klar nach: Möchten Sie die Buchung komplett abbrechen oder "
+                    "möchten Sie ein Feld ändern (Service, Arzt, Termin oder Name)? "
+                    "Wenn der Patient abbrechen möchte, bestätige kurz den Abbruch."
                     if self._lang == "de" else
-                    "The patient wants to change something. Ask what they want to change "
-                    "(service, doctor, slot, or name) and go back to the relevant step."
+                    "The patient did not confirm the summary. Ask clearly: do you want to "
+                    "cancel the booking entirely, or change a field (service, doctor, slot, or name)? "
+                    "If the patient wants to cancel, acknowledge cancellation briefly."
                 )
             else:
                 # Ambiguous — ask again
@@ -304,6 +347,28 @@ class FunctiomedAgent(Agent):
                     if self._lang == "de" else
                     "The patient's response was unclear. Politely ask again whether they "
                     "want to confirm the appointment."
+                )
+            turn_ctx.add_message(role="system", content=instr)
+            return
+
+        if self._booking.step == "awaiting_cancel_or_change":
+            if _is_cancel_intent(user_text, self._lang):
+                await self._publish_cancelled_state()
+                self._booking = BookingState()
+                instr = (
+                    "Der Patient möchte die Buchung abbrechen. Bestätige kurz den Abbruch "
+                    "und biete an, später eine neue Buchung zu starten."
+                    if self._lang == "de" else
+                    "The patient wants to cancel the booking. Briefly confirm cancellation "
+                    "and offer to start a new booking later."
+                )
+            else:
+                instr = (
+                    "Der Patient möchte die Buchung nicht abbrechen. Frage, welches Feld geändert werden soll "
+                    "(Service, Arzt, Termin oder Name), und gehe dann zum passenden Schritt zurück."
+                    if self._lang == "de" else
+                    "The patient does not want to cancel. Ask which field should be changed "
+                    "(service, doctor, slot, or name), then return to the appropriate step."
                 )
             turn_ctx.add_message(role="system", content=instr)
             return
@@ -644,16 +709,16 @@ class FunctiomedAgent(Agent):
             return (
                 f"Danke. Ich habe Ihren Namen als: {patient_name} verstanden. "
                 "Falls die Schreibweise nicht korrekt ist, buchstabieren Sie bitte Ihren vollständigen Namen langsam (Buchstabe für Buchstabe). "
-                f"Andernfalls hier die Buchungszusammenfassung: {b.service} mit {b.doctor} "
-                f"am {b.slot_date} um {b.slot_time} für {patient_name}. "
-                "Soll ich diesen Termin jetzt bestätigen? Bitte antworten Sie mit Ja oder Nein."
+                f"Vor der Bestätigung hier die vollständige Zusammenfassung: Service {b.service}, Arzt {b.doctor}, "
+                f"Termin {b.slot_date} um {b.slot_time}, Patientenname {patient_name}. "
+                "Soll ich diese Buchung jetzt bestätigen? Sagen Sie Ja zum Bestätigen oder Abbrechen / Ändern."
             )
         return (
             f"Thanks. I heard your name as: {patient_name}. "
             "If the spelling is not correct, please spell your full name slowly, letter by letter. "
-            f"Otherwise here is your full booking summary: {b.service} with {b.doctor} "
-            f"on {b.slot_date} at {b.slot_time} for {patient_name}. "
-            "Shall I confirm this appointment? Please say yes or no."
+            f"Before I confirm, here is your full booking summary: service {b.service}, doctor {b.doctor}, "
+            f"slot {b.slot_date} at {b.slot_time}, patient name {patient_name}. "
+            "Do you want me to confirm this booking now? Say yes to confirm, or say cancel / change."
         )
 
     @function_tool()
