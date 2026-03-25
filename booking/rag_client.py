@@ -14,14 +14,13 @@ import httpx
 
 log = logging.getLogger(__name__)
 
-RAG_BACKEND_URL = os.getenv("RAG_BACKEND_URL", "http://localhost:8000")
-RETRIEVE_TIMEOUT = 4.0   # seconds — keep low for voice latency
-TOP_K = 5                # chunks to inject into context
+RAG_BACKEND_URL  = os.getenv("RAG_BACKEND_URL", "http://localhost:8000")
+RETRIEVE_TIMEOUT = float(os.getenv("RAG_RETRIEVE_TIMEOUT", "6.0"))   # increased from 4.0
+TOP_K            = int(os.getenv("RAG_TOP_K", "5"))
 
-# Voice agents must keep context small, otherwise the LLM tends to produce
-# long answers which can exceed TTS input limits.
-MAX_CONTEXT_CHARS = int(os.getenv("RAG_MAX_CONTEXT_CHARS", "1400"))
-MAX_CHUNK_CHARS = int(os.getenv("RAG_MAX_CHUNK_CHARS", "350"))
+# Increased limits — 1400 chars was too small for useful answers.
+MAX_CONTEXT_CHARS = int(os.getenv("RAG_MAX_CONTEXT_CHARS", "3000"))
+MAX_CHUNK_CHARS   = int(os.getenv("RAG_MAX_CHUNK_CHARS",   "600"))
 
 
 async def retrieve_context(query: str, top_k: int = TOP_K) -> str:
@@ -42,32 +41,49 @@ async def retrieve_context(query: str, top_k: int = TOP_K) -> str:
             data = resp.json()
 
         results = data.get("results", [])
+        log.info("[RAG] /retrieve returned %d results for query: %s", len(results), query[:80])
+
         if not results:
+            log.warning("[RAG] No results from backend for query: %s", query[:80])
             return ""
 
-        # Format chunks for injection into chat context
-        lines = ["Relevant clinic knowledge:"]
+        # Format chunks for injection into chat context.
+        # The header explicitly instructs the LLM to use this content —
+        # without it the LLM tends to ignore injected context.
+        lines = [
+            "CLINIC KNOWLEDGE BASE — use the following facts to answer the patient's question. "
+            "Do NOT contradict or ignore this information:"
+        ]
         total = 0
         for r in results:
-            source = r.get("page_name") or "clinic docs"
+            source  = r.get("page_name") or "clinic docs"
             content = (r.get("content", "") or "").strip()
-            if content:
-                if len(content) > MAX_CHUNK_CHARS:
-                    content = content[: MAX_CHUNK_CHARS - 1].rstrip() + "…"
-                snippet = f"[{source}] {content}"
-                # Stop before exceeding global cap
-                if total + len(snippet) > MAX_CONTEXT_CHARS:
-                    break
-                lines.append(snippet)
-                total += len(snippet)
+            score   = r.get("score", 0)
+            if not content:
+                continue
+            if len(content) > MAX_CHUNK_CHARS:
+                content = content[:MAX_CHUNK_CHARS - 1].rstrip() + "…"
+            snippet = f"[{source}] {content}"
+            if total + len(snippet) > MAX_CONTEXT_CHARS:
+                log.info("[RAG] Context cap reached after %d chars", total)
+                break
+            lines.append(snippet)
+            total += len(snippet)
+            log.debug("[RAG] chunk score=%.4f source=%s", score, source)
 
-        return "\n\n".join(lines)
+        if len(lines) == 1:
+            # Only the header, no real chunks made it in
+            return ""
+
+        context = "\n\n".join(lines)
+        log.info("[RAG] Injecting %d chars across %d chunks", total, len(lines) - 1)
+        return context
 
     except httpx.TimeoutException:
-        log.warning("RAG retrieval timed out for query: %s", query[:60])
+        log.warning("[RAG] Retrieval timed out (%.1fs) for query: %s", RETRIEVE_TIMEOUT, query[:60])
         return ""
     except Exception as e:
-        log.error("Cannot reach RAG backend at %s: %s", RAG_BACKEND_URL, e)
+        log.error("[RAG] Cannot reach RAG backend at %s: %s", RAG_BACKEND_URL, e)
         return ""
 
 
@@ -78,5 +94,5 @@ async def health_check() -> bool:
             resp = await client.get(f"{RAG_BACKEND_URL}/")
             return resp.status_code == 200
     except Exception as e:
-        log.warning("RAG health check failed: %s", e)
+        log.warning("[RAG] Health check failed: %s", e)
         return False

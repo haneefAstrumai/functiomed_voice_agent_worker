@@ -5,6 +5,20 @@ KEY CHANGE: Added explicit confirmation gate.
   confirm_name  → presents full summary → sets step="awaiting_confirmation"
   confirm_booking → checks user said "yes" → then calls save_appointment
   save_appointment is NEVER called directly by the LLM anymore.
+
+RAG FIX: Context is now injected as role="user" (not role="system").
+  OpenAI silently ignores system messages added mid-conversation.
+  Injecting as user-role with an explicit instruction prefix ensures
+  the LLM actually reads and uses the retrieved clinic knowledge.
+  
+RAG FIX 2: Removed booking intent redirect in RAG mode.
+  Previously, any question with booking keywords would get redirected
+  to start a booking session instead of answering clinic questions.
+  Now RAG mode properly answers all clinic-related questions.
+
+MODE SWITCHING: Added dynamic mode switching between RAG and booking
+  based on user intent. Agent can now handle both types of queries
+  in the same session.
 """
 
 import asyncio
@@ -12,6 +26,7 @@ import json
 import logging
 import os
 import re
+import time
 from difflib import SequenceMatcher
 
 from dotenv import load_dotenv
@@ -79,7 +94,6 @@ def _is_affirmative(text: str, lang: str) -> bool:
     t = re.sub(r"[^\w\s]", " ", t)
     words = set(t.split())
     pool = _AFFIRMATIVE_DE if lang == "de" else _AFFIRMATIVE_EN
-    # Check word-level match OR substring match for multi-word phrases
     if words & pool:
         return True
     for phrase in pool:
@@ -99,6 +113,7 @@ def _is_negative(text: str, lang: str) -> bool:
         if " " in phrase and phrase in t:
             return True
     return False
+
 
 def _is_cancel_intent(text: str, lang: str) -> bool:
     t = (text or "").lower().strip()
@@ -122,6 +137,11 @@ def build_system_prompt(lang: str) -> str:
             "Wechsle niemals ins Englische, unabhängig davon, in welcher Sprache der Patient schreibt oder spricht. "
             "Alle Begrüßungen, Bestätigungen, Fragen und Informationen sind auf Deutsch."
         )
+        rag_instruction = (
+            "WICHTIG: Wenn du Informationen über die Klinik beantwortest, verwende AUSSCHLIESSLICH die "
+            "Informationen, die dir im Kontext bereitgestellt werden. Erfinde keine Informationen. "
+            "Wenn die Antwort nicht im Kontext ist, sage dass du es nicht weißt."
+        )
         language_note = "Sprache: Deutsch (fest konfiguriert — kein Sprachwechsel erlaubt)"
     else:
         language_instruction = (
@@ -129,12 +149,17 @@ def build_system_prompt(lang: str) -> str:
             "Never switch to German or any other language, regardless of what language the patient uses. "
             "All greetings, confirmations, questions, and information must be in English."
         )
+        rag_instruction = (
+            "IMPORTANT: When answering questions about the clinic, use ONLY the information provided "
+            "in the context. Do not make up information. If the answer is not in the context, say you don't know."
+        )
         language_note = "Language: English (fixed — no language switching allowed)"
 
     return f"""You are the friendly voice assistant for Functiomed, a medical clinic in Zurich.
 You speak naturally and concisely — this is a voice conversation, so keep answers short and clear.
 
 {language_instruction}
+{rag_instruction}
 
 Your two responsibilities:
 1. Answer questions about the clinic using the knowledge injected into your context.
@@ -149,7 +174,7 @@ Critical booking constraints:
 - For booking flows, use ONLY the booking tools (database-backed). Do not answer booking questions from retrieved context.
 - First message in booking mode must be only a greeting + "how can I assist you in booking?" (in the configured language).
 - Do NOT list services in the first greeting.
-- Call get_services only when the user asks to book or asks about available services.
+- Call get_services ONLY when the user explicitly asks to start a BOOKING flow. If the user is just asking a general question like "What services do you offer", DO NOT call get_services — answer via the retrieved context.
 
 Booking flow — follow this EXACT order, NEVER skip a step:
   STEP 1: call get_services     → present options → call confirm_service
@@ -263,8 +288,9 @@ class FunctiomedAgent(Agent):
             "collect_slot":           "collect_slot",
             "slot":                   "collect_name",
             "collect_name":           "collect_name",
-            "name":                   "confirm",           # summary shown, awaiting verbal yes
-            "awaiting_confirmation":  "confirm",           # still on confirm screen
+            "name":                   "confirm",
+            "awaiting_confirmation":  "confirm",
+            "processing":             "processing",
             "done":                   "done",
         }
         payload = {
@@ -308,6 +334,23 @@ class FunctiomedAgent(Agent):
         except Exception as e:
             log.error("[STATE] Failed to publish cancelled state: %s", e)
 
+    async def _publish_mode_change(self, new_mode: str) -> None:
+        """Notify frontend when agent switches modes"""
+        payload = {
+            "type": "mode_change",
+            "mode": new_mode,
+        }
+        try:
+            if not self._room:
+                raise RuntimeError("Room unavailable for mode_change publish")
+            await self._room.local_participant.publish_data(
+                json.dumps(payload).encode(),
+                reliable=True,
+            )
+            log.info(f"[MODE] Published mode change to: {new_mode}")
+        except Exception as e:
+            log.error("[MODE] Failed to publish mode change: %s", e)
+
     # ── RAG injection ─────────────────────────────────────────
 
     async def on_user_turn_completed(
@@ -316,10 +359,12 @@ class FunctiomedAgent(Agent):
         new_message: ChatMessage,
     ) -> None:
         user_text = new_message.text_content or ""
+        
+        # Debug logging
+        log.info(f"[DEBUG] Agent mode: {self.mode}, Booking step: {self._booking.step}")
+        log.info(f"[DEBUG] User said: {user_text[:100]}")
 
         # ── Confirmation-gate intercept ───────────────────────
-        # When we are waiting for a verbal yes/no, interpret the
-        # user's reply here so the LLM knows what to do next.
         if self._booking.step == "awaiting_confirmation":
             if _is_affirmative(user_text, self._lang):
                 instr = (
@@ -340,7 +385,6 @@ class FunctiomedAgent(Agent):
                     "If the patient wants to cancel, acknowledge cancellation briefly."
                 )
             else:
-                # Ambiguous — ask again
                 instr = (
                     "Die Antwort des Patienten war unklar. Frage ihn erneut höflich, "
                     "ob er den Termin bestätigen möchte."
@@ -373,67 +417,82 @@ class FunctiomedAgent(Agent):
             turn_ctx.add_message(role="system", content=instr)
             return
 
-        # ── Booking mode: no RAG ──────────────────────────────
+        # ── MODE SWITCHING LOGIC (MUST COME BEFORE MODE CHECKS) ──
+        # Detect if user is asking a general question (not related to booking)
+        general_question_keywords = [
+            "what", "who", "where", "when", "why", "how", "tell me", "explain",
+            "was", "wer", "wo", "wann", "warum", "wie", "erklären", "was ist",
+            "who is", "what is", "ceo", "owner", "founder", "history", "location",
+            "hours", "open", "close", "price", "cost", "fee", "insurance",
+            "services", "leistungen", "öffnungszeiten", "adresse", "service"
+        ]
+        
+        is_general_question = any(kw in user_text.lower() for kw in general_question_keywords)
+        is_booking_intent = self._is_booking_intent(user_text)
+        
+        # If it's a general question and we're in booking mode but not in active booking flow
+        if is_general_question and self.mode == "booking" and self._booking.step == "idle":
+            log.info("[MODE] Switching from booking to RAG for general question")
+            self._mode = "rag"
+            await self._publish_mode_change("rag")
+            # Add a system message to explain the mode switch
+            switch_msg = (
+                "Note: The user is asking a general clinic question. Switching to answering mode."
+                if self._lang == "en" else
+                "Hinweis: Der Benutzer stellt eine allgemeine Klinikfrage. Wechsle in den Antwortmodus."
+            )
+            turn_ctx.add_message(role="system", content=switch_msg)
+        
+        # If it's a booking intent and we're in RAG mode
+        if is_booking_intent and self.mode == "rag":
+            log.info("[MODE] Switching from RAG to booking for booking intent")
+            self._mode = "booking"
+            await self._publish_mode_change("booking")
+            # Add a system message to explain the mode switch
+            switch_msg = (
+                "Note: The user wants to book an appointment. Switching to booking mode."
+                if self._lang == "en" else
+                "Hinweis: Der Benutzer möchte einen Termin buchen. Wechsle in den Buchungsmodus."
+            )
+            turn_ctx.add_message(role="system", content=switch_msg)
+
+        # ── Booking mode: handle booking flow ───────────────────
         if self.mode == "booking":
+            # Don't do RAG in booking mode - let the LLM handle booking
             return
 
-        # ── RAG mode: block booking intent ───────────────────
-        if self.mode == "rag" and self._is_booking_intent(user_text):
-            if self._lang == "de":
-                reply = (
-                    "Ich beantworte Fragen zur Klinik in dieser Sitzung. "
-                    "Um einen Termin zu buchen, starten Sie bitte eine Buchungs-Sitzung."
-                )
-            else:
-                reply = (
-                    "I can answer clinic questions in this session. "
-                    "To book an appointment, please start a Booking session."
-                )
-            turn_ctx.add_message(role="assistant", content=reply)
-            return
-
-        booking_intent = self._is_booking_intent(user_text)
-        if booking_intent:
-            log.info("[RAG] Skipping — booking intent detected")
-            if self._booking.step in ("idle", "done"):
-                self._booking.step = "idle"
-                if self._lang == "de":
-                    instr = (
-                        "Der Patient möchte einen Termin buchen. "
-                        "Rufe sofort das get_services-Tool auf und frage den Patienten dann, welchen Service er möchte."
-                    )
-                else:
-                    instr = (
-                        "User wants to book an appointment. "
-                        "Immediately call the get_services tool, then ask the user to choose a service."
-                    )
-                turn_ctx.add_message(role="system", content=instr)
-            return
-
+        # ── RAG mode: handle questions ──────────────────────────
+        # Skip RAG if we're in the middle of a booking
         if self._booking.step not in ("idle", "done"):
-            log.info("[RAG] Skipping — booking in progress (step=%s)", self._booking.step)
+            log.info("[RAG] Skipping retrieval — booking in progress (step=%s)", self._booking.step)
             return
 
+        # ── Retrieve and inject context ────────────────────────
         context = await retrieve_context(user_text, top_k=5)
         if context:
-            turn_ctx.add_message(
-                role="system",
-                content=f"[Clinic knowledge retrieved for this query]\n\n{context}",
-            )
-            log.info("[RAG] Injected %d chars of context", len(context))
+            combined = f"{context}\n\nPatient question: {user_text}"
+            if hasattr(new_message, "content"):
+                new_message.content = combined
+            if hasattr(new_message, "text_content"):
+                new_message.text_content = combined
+            log.info("[RAG] Injected %d chars of context for query: %r", len(context), user_text[:60])
         else:
-            log.info("[RAG] No context retrieved or backend unavailable")
+            log.warning(
+                "[RAG] No context retrieved — LLM will answer from its own knowledge for: %r",
+                user_text[:60],
+            )
 
     # ── Booking tools ─────────────────────────────────────────
 
     @function_tool()
     async def get_services(self, context: RunContext, dummy: str = "") -> str:
-        """Get all available clinic services. Call this when the user wants to book."""
+        """Get all available clinic services. ONLY call this if the user is explicitly starting a booking flow."""
         if self.mode != "booking":
             if self._lang == "de":
                 return "Buchungen sind in dieser Sitzung deaktiviert. Bitte starten Sie eine Buchungs-Sitzung."
             return "Booking is disabled in this session. Please start a Booking session."
         log.info("[GET_SERVICES] fetching services from backend")
+        t0 = time.perf_counter()
         try:
             services = await get_services()
         except Exception as e:
@@ -441,6 +500,7 @@ class FunctiomedAgent(Agent):
             if self._lang == "de":
                 return "Es gab einen technischen Fehler. Bitte versuchen Sie es erneut."
             return "There was a technical error fetching services. Please try again."
+        dt_ms = (time.perf_counter() - t0) * 1000.0
         if not services:
             log.warning("[GET_SERVICES] backend returned no services")
             if self._lang == "de":
@@ -450,6 +510,7 @@ class FunctiomedAgent(Agent):
         self._booking.step = "collect_service"
         names = [s["name"] for s in services]
         log.info("[GET_SERVICES] returning %d services: %s", len(names), names)
+        log.info("[TIMER][booking] get_services %.1fms (count=%d)", dt_ms, len(names))
         await self._publish_state(context, available=names)
         return f"Available services: {', '.join(names)}"
 
@@ -507,6 +568,7 @@ class FunctiomedAgent(Agent):
             if self._lang == "de":
                 return "Bitte wählen Sie zuerst einen Service aus."
             return "Please select a service first."
+        t0 = time.perf_counter()
         try:
             doctors = await get_doctors_for_service(self._booking.service)
         except Exception as e:
@@ -514,6 +576,7 @@ class FunctiomedAgent(Agent):
             if self._lang == "de":
                 return "Es gab einen technischen Fehler beim Abrufen der Ärzte. Bitte versuchen Sie es erneut."
             return "There was a technical error fetching doctors. Please try again."
+        dt_ms = (time.perf_counter() - t0) * 1000.0
         if not doctors:
             log.warning("[GET_DOCTORS] no doctors for service=%r", self._booking.service)
             if self._lang == "de":
@@ -527,6 +590,7 @@ class FunctiomedAgent(Agent):
             display = f"{title} {name}".strip() if title else name
             lines.append(display)
         log.info("[GET_DOCTORS] returning %d doctors: %s", len(lines), lines)
+        log.info("[TIMER][booking] get_doctors %.1fms (count=%d)", dt_ms, len(lines))
         await self._publish_state(context, available=lines)
         return f"Available doctors: {', '.join(lines)}"
 
@@ -603,6 +667,7 @@ class FunctiomedAgent(Agent):
                 return "Bitte wählen Sie zuerst einen Arzt aus."
             return "Doctor not selected yet. Please call confirm_doctor first."
 
+        t0 = time.perf_counter()
         try:
             slots = await get_slots(self._booking.service, self._booking.doctor)
         except Exception as e:
@@ -610,6 +675,7 @@ class FunctiomedAgent(Agent):
             if self._lang == "de":
                 return "Es gab einen technischen Fehler beim Abrufen der Termine. Bitte versuchen Sie es erneut."
             return "There was a technical error fetching slots. Please try again."
+        dt_ms = (time.perf_counter() - t0) * 1000.0
 
         log.info("[GET_SLOTS] backend returned %d slots", len(slots) if slots else 0)
 
@@ -627,6 +693,7 @@ class FunctiomedAgent(Agent):
         slot_labels = [f"{s['slot_date']} at {s['slot_time']}" for s in slots[:5]]
         await self._publish_state(context, available=slot_labels)
         log.info("[GET_SLOTS] returning %d slots to LLM", len(lines))
+        log.info("[TIMER][booking] get_slots %.1fms (count=%d)", dt_ms, len(slots))
         return (
             "Available slots:\n" + "\n".join(lines) +
             "\n\nWhen confirming, pass the exact slot_id UUID shown above."
@@ -778,12 +845,21 @@ class FunctiomedAgent(Agent):
             b.service, b.doctor, b.slot_id, b.patient_name,
         )
 
+        t0_total = time.perf_counter()
+        t0_save  = time.perf_counter()
+
+        # Let the UI show immediate progress while we wait for the backend save.
+        b.step = "processing"
+        await self._publish_state(context)
+
         result = await save_appointment(
             service_name=b.service,
             doctor_name=b.doctor,
             patient_name=b.patient_name,
             slot_id=b.slot_id,
         )
+        dt_save_ms = (time.perf_counter() - t0_save) * 1000.0
+        log.info("[TIMER][booking] confirm_booking save_appointment %.1fms", dt_save_ms)
 
         booking = result.get("booking") or result
         conf    = booking.get("confirmation_number")
@@ -814,7 +890,16 @@ class FunctiomedAgent(Agent):
                 log.error("[STATE] Failed to publish done state: %s", e)
 
             self._booking = BookingState()
+            
+            # Reset mode to RAG after booking is complete
+            self._mode = "rag"
+            await self._publish_mode_change("rag")
+            log.info("[MODE] Booking completed, switching back to RAG mode")
 
+            log.info(
+                "[TIMER][booking] confirm_booking total %.1fms (confirmation=%s)",
+                (time.perf_counter() - t0_total) * 1000.0, conf,
+            )
             if self._lang == "de":
                 return (
                     f"Ihr Termin ist bestätigt! "
@@ -828,6 +913,10 @@ class FunctiomedAgent(Agent):
             )
 
         log.error("[CONFIRM_BOOKING] Backend returned no confirmation: %s", result)
+        log.info(
+            "[TIMER][booking] confirm_booking total %.1fms (no confirmation)",
+            (time.perf_counter() - t0_total) * 1000.0,
+        )
         if self._lang == "de":
             return "Bei der Speicherung Ihrer Buchung ist ein Problem aufgetreten. Bitte rufen Sie die Klinik direkt an."
         return "There was a problem saving your booking. Please call the clinic directly."
@@ -846,6 +935,13 @@ async def entrypoint(ctx: agents.JobContext):
     room_name  = (ctx.room.name or "").lower()
     room_parts = room_name.split("-")
     room_mode  = "booking" if "booking" in room_parts else "rag"
+    
+    # Debug logging
+    log.info(f"[DEBUG] Room name: {room_name}")
+    log.info(f"[DEBUG] Room parts: {room_parts}")
+    log.info(f"[DEBUG] Parsed mode: {room_mode}")
+    log.info(f"[DEBUG] Contains 'booking'? {'booking' in room_parts}")
+    log.info(f"[DEBUG] Contains 'rag'? {'rag' in room_parts}")
 
     room_lang = "en"
     if "de" in room_parts:
@@ -910,6 +1006,18 @@ async def entrypoint(ctx: agents.JobContext):
             )
         except Exception as e:
             log.error("[STATE] Failed to publish initial idle state: %s", e)
+
+        # Warm the booking client cache while we greet the user.
+        # This removes the first-call latency for `/clinic/services`.
+        try:
+            asyncio.create_task(get_services()).add_done_callback(
+                lambda fut: log.info(
+                    "[WARMUP][booking] get_services warmup done (ok=%s)",
+                    not fut.cancelled() and fut.exception() is None,
+                )
+            )
+        except Exception as e:
+            log.warning("[WARMUP][booking] failed to start get_services warmup: %s", e)
 
     if room_mode == "booking":
         if room_lang == "de":
