@@ -11,6 +11,8 @@ The agent's own LLM (OpenAI) generates the final answer.
 import logging
 import os
 import httpx
+import time
+import asyncio
 
 log = logging.getLogger(__name__)
 
@@ -22,6 +24,9 @@ TOP_K            = int(os.getenv("RAG_TOP_K", "5"))
 MAX_CONTEXT_CHARS = int(os.getenv("RAG_MAX_CONTEXT_CHARS", "3000"))
 MAX_CHUNK_CHARS   = int(os.getenv("RAG_MAX_CHUNK_CHARS",   "600"))
 
+_rag_cache: dict[str, dict[str, object]] = {}
+_RAG_CACHE_TTL_S = float(os.getenv("RAG_CACHE_TTL_S", "60"))
+_CACHE_LOCK = asyncio.Lock()
 
 async def retrieve_context(query: str, top_k: int = TOP_K) -> str:
     """
@@ -32,6 +37,14 @@ async def retrieve_context(query: str, top_k: int = TOP_K) -> str:
     to its own knowledge gracefully).
     """
     try:
+        cache_key = f"{query}:{top_k}"
+        async with _CACHE_LOCK:
+            entry = _rag_cache.get(cache_key)
+            if entry and time.monotonic() < float(entry.get("expires_at") or 0.0):
+                log.info("[RAG] Cache hit for query: %s", query[:60])
+                return str(entry.get("value", ""))
+
+        t0_req = time.perf_counter()
         async with httpx.AsyncClient(timeout=RETRIEVE_TIMEOUT) as client:
             resp = await client.post(
                 f"{RAG_BACKEND_URL}/retrieve",
@@ -39,6 +52,9 @@ async def retrieve_context(query: str, top_k: int = TOP_K) -> str:
             )
             resp.raise_for_status()
             data = resp.json()
+            
+        dt_req_ms = (time.perf_counter() - t0_req) * 1000.0
+        log.info("[TIMER][rag] httpx retrieve backend call completed in %.1fms", dt_req_ms)
 
         results = data.get("results", [])
         log.info("[RAG] /retrieve returned %d results for query: %s", len(results), query[:80])

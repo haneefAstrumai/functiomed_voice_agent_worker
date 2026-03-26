@@ -196,7 +196,7 @@ Critical booking constraints:
 - For booking flows, use ONLY the booking tools (database-backed). Do not answer booking questions from retrieved context.
 - First message in booking mode must be only a greeting + "how can I assist you in booking?" (in the configured language).
 - Do NOT list services in the first greeting.
-- Call get_services ONLY when the user explicitly asks to start a BOOKING flow. If the user is just asking a general question like "What services do you offer", DO NOT call get_services — answer via the retrieved context.
+- In booking mode, get_services is the ONLY source of service information — there is no RAG context. Call get_services whenever the user asks about services, wants to book, or asks what the clinic offers. Do NOT refuse to list services; use get_services and present the results.
 
 Booking flow — follow this EXACT order, NEVER skip a step:
   STEP 1: call get_services     → present options → call confirm_service
@@ -445,7 +445,11 @@ class FunctiomedAgent(Agent):
 
             # ── RAG mode: handle questions ──────────────────────────
             elif self.mode == "rag" and self._booking.step in ("idle", "done"):
+                t0_rag = time.perf_counter()
                 context = await retrieve_context(user_text, top_k=5)
+                dt_rag_ms = (time.perf_counter() - t0_rag) * 1000.0
+                log.info("[TIMER][rag] retrieve_context %.1fms", dt_rag_ms)
+                
                 if context:
                     combined = f"{context}\n\nPatient question: {user_text}"
                     if hasattr(last_user_msg, "content"):
@@ -529,6 +533,18 @@ class FunctiomedAgent(Agent):
         self._booking.step    = "service"
         log.info("[CONFIRM_SERVICE] stored service=%r step=service", exact_name)
         await self._publish_state(context)
+
+        # ── Background prefetch: start fetching doctors NOW so get_doctors hits cache ──
+        async def _prefetch_doctors() -> None:
+            try:
+                log.info("[PREFETCH] Fetching doctors for service=%r in background", exact_name)
+                t0 = time.perf_counter()
+                await get_doctors_for_service(exact_name)
+                log.info("[PREFETCH] Doctors ready in %.0fms", (time.perf_counter()-t0)*1000)
+            except Exception as exc:
+                log.warning("[PREFETCH] doctors prefetch failed: %s", exc)
+        asyncio.ensure_future(_prefetch_doctors())
+
         if self._lang == "de":
             return f"Service bestätigt: {exact_name}. Ich suche jetzt nach verfügbaren Ärzten."
         return f"Service confirmed: {exact_name}. Let me find available doctors."
@@ -618,6 +634,20 @@ class FunctiomedAgent(Agent):
         self._booking.step   = "doctor"
         log.info("[CONFIRM_DOCTOR] stored doctor=%r step=doctor", self._booking.doctor)
         await self._publish_state(context)
+
+        # ── Background prefetch: start fetching slots NOW so get_slots hits cache ──
+        _svc = self._booking.service
+        _doc = display_name
+        async def _prefetch_slots() -> None:
+            try:
+                log.info("[PREFETCH] Fetching slots for service=%r doctor=%r in background", _svc, _doc)
+                t0 = time.perf_counter()
+                await get_slots(_svc, _doc)
+                log.info("[PREFETCH] Slots ready in %.0fms", (time.perf_counter()-t0)*1000)
+            except Exception as exc:
+                log.warning("[PREFETCH] slots prefetch failed: %s", exc)
+        asyncio.ensure_future(_prefetch_slots())
+
         if self._lang == "de":
             return f"Arzt bestätigt: {display_name}. Ich prüfe jetzt die verfügbaren Termine."
         return f"Doctor confirmed: {display_name}. Let me check available time slots."
@@ -929,10 +959,11 @@ async def entrypoint(ctx: agents.JobContext):
         log.warning("⚠️  Backend unreachable at %s", os.getenv("RAG_BACKEND_URL"))
 
     requested_model = (os.getenv("AGENT_LLM_MODEL") or "").strip()
-    openai_model    = requested_model or "gpt-4o-mini"
+    openai_model    = requested_model or "gpt-4o"
     if openai_model.startswith(("llama-", "mixtral", "gemma")):
-        log.warning("AGENT_LLM_MODEL=%s is not an OpenAI model; falling back to gpt-4o-mini", openai_model)
-        openai_model = "gpt-4o-mini"
+        log.warning("AGENT_LLM_MODEL=%s is not an OpenAI model; falling back to gpt-4o", openai_model)
+        openai_model = "gpt-4o"
+    log.info("[LLM] Using model: %s", openai_model)
 
     initial_ctx = ChatContext()
     initial_ctx.add_message(
@@ -956,8 +987,12 @@ async def entrypoint(ctx: agents.JobContext):
         llm=openai.LLM(
             model=openai_model,
             api_key=os.getenv("OPENAI_API_KEY"),
+            temperature=0.3,           # deterministic, better for booking flows
+            max_completion_tokens=200, # short answers = less TTS to generate
         ),
-        tts=openai.TTS(voice="alloy"),
+        # Deepgram TTS: streaming=True → first audio chunk plays immediately,
+        # no waiting for the full response like openai.TTS (streaming=False)
+        tts=deepgram.TTS(model="aura-2-andromeda-en"),
         vad=silero.VAD.load(),
     )
 
