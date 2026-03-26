@@ -45,6 +45,28 @@ from booking.booking_client import (
     save_appointment,
 )
 
+# --- DEEPGRAM MONKEYPATCH FOR TRIPLE/DOUBLE PHONE NUMBERS ---
+# Deepgram natively allows term replacement via query params, but LiveKit doesn't
+# expose it. We monkeypatch the URL builder to include replacements for digits.
+import livekit.plugins.deepgram._utils as dg_utils
+from urllib.parse import urlencode
+
+_orig_to_deepgram_url = dg_utils._to_deepgram_url
+def _patched_to_deepgram_url(opts: dict, base_url: str, *, websocket: bool) -> str:
+    url = _orig_to_deepgram_url(opts, base_url, websocket=websocket)
+    replacements = []
+    words = ["zero", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine"]
+    for i in range(10):
+        replacements.append(("replace", f"triple {i}:{i}{i}{i}"))
+        replacements.append(("replace", f"double {i}:{i}{i}"))
+        replacements.append(("replace", f"triple {words[i]}:{i}{i}{i}"))
+        replacements.append(("replace", f"double {words[i]}:{i}{i}"))
+    extra_qs = urlencode(replacements)
+    return url + ("&" if "?" in url else "?") + extra_qs
+
+dg_utils._to_deepgram_url = _patched_to_deepgram_url
+# -----------------------------------------------------------
+
 log = logging.getLogger(__name__)
 
 # ─────────────────────────────────────────────────────────────
