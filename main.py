@@ -923,6 +923,7 @@ async def entrypoint(ctx: agents.JobContext):
         "interim_results": True,
         "punctuate":       True,
         "smart_format":    True,
+        "numerals":        True,
         "language":        room_lang,
     }
 
