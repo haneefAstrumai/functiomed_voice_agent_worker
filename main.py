@@ -33,7 +33,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from livekit import agents
-from livekit.agents import AgentSession, Agent, ChatContext, ChatMessage, RoomInputOptions
+from livekit.agents import AgentSession, Agent, ChatContext, ChatMessage, RoomInputOptions, llm
 from livekit.plugins import openai, deepgram, silero
 from livekit.agents import function_tool, RunContext
 
@@ -353,134 +353,90 @@ class FunctiomedAgent(Agent):
 
     # ── RAG injection ─────────────────────────────────────────
 
-    async def on_user_turn_completed(
+    async def llm_node(
         self,
-        turn_ctx: ChatContext,
-        new_message: ChatMessage,
-    ) -> None:
-        user_text = new_message.text_content or ""
+        chat_ctx: ChatContext,
+        tools: list[llm.Tool],
+        model_settings,
+    ):
+        """Intercept LLM generation to inject RAG context or handle booking gates for both voice and text."""
+        last_user_msg = next((m for m in reversed(chat_ctx.items) if isinstance(m, ChatMessage) and m.role == "user"), None)
         
-        # Debug logging
-        log.info(f"[DEBUG] Agent mode: {self.mode}, Booking step: {self._booking.step}")
-        log.info(f"[DEBUG] User said: {user_text[:100]}")
+        if last_user_msg and not getattr(last_user_msg, "_intercepted", False):
+            last_user_msg._intercepted = True  # Prevent re-intercepting on tool callbacks
+            user_text = last_user_msg.text_content or getattr(last_user_msg, "content", "")
+            if isinstance(user_text, list): user_text = str(user_text)
+            
+            log.info(f"[DEBUG] Agent mode: {self.mode}, Booking step: {self._booking.step}")
+            log.info(f"[DEBUG] User said: {user_text[:100]}")
 
-        # ── Confirmation-gate intercept ───────────────────────
-        if self._booking.step == "awaiting_confirmation":
-            if _is_affirmative(user_text, self._lang):
-                instr = (
-                    "Der Patient hat die Buchung bestätigt. Rufe jetzt sofort das confirm_booking-Tool auf."
-                    if self._lang == "de" else
-                    "The patient has confirmed the booking. Call the confirm_booking tool now."
-                )
-            elif _is_negative(user_text, self._lang):
-                self._booking.step = "awaiting_cancel_or_change"
-                instr = (
-                    "Der Patient hat die Zusammenfassung nicht bestätigt. "
-                    "Frage jetzt klar nach: Möchten Sie die Buchung komplett abbrechen oder "
-                    "möchten Sie ein Feld ändern (Service, Arzt, Termin oder Name)? "
-                    "Wenn der Patient abbrechen möchte, bestätige kurz den Abbruch."
-                    if self._lang == "de" else
-                    "The patient did not confirm the summary. Ask clearly: do you want to "
-                    "cancel the booking entirely, or change a field (service, doctor, slot, or name)? "
-                    "If the patient wants to cancel, acknowledge cancellation briefly."
-                )
-            else:
-                instr = (
-                    "Die Antwort des Patienten war unklar. Frage ihn erneut höflich, "
-                    "ob er den Termin bestätigen möchte."
-                    if self._lang == "de" else
-                    "The patient's response was unclear. Politely ask again whether they "
-                    "want to confirm the appointment."
-                )
-            turn_ctx.add_message(role="system", content=instr)
-            return
+            # ── Confirmation-gate intercept ───────────────────────
+            if self._booking.step == "awaiting_confirmation":
+                if _is_affirmative(user_text, self._lang):
+                    instr = (
+                        "Der Patient hat die Buchung bestätigt. Rufe jetzt sofort das confirm_booking-Tool auf."
+                        if self._lang == "de" else
+                        "The patient has confirmed the booking. Call the confirm_booking tool now."
+                    )
+                elif _is_negative(user_text, self._lang):
+                    self._booking.step = "awaiting_cancel_or_change"
+                    instr = (
+                        "Der Patient hat die Zusammenfassung nicht bestätigt. "
+                        "Frage jetzt klar nach: Möchten Sie die Buchung komplett abbrechen oder "
+                        "möchten Sie ein Feld ändern (Service, Arzt, Termin oder Name)? "
+                        "Wenn der Patient abbrechen möchte, bestätige kurz den Abbruch."
+                        if self._lang == "de" else
+                        "The patient did not confirm the summary. Ask clearly: do you want to "
+                        "cancel the booking entirely, or change a field (service, doctor, slot, or name)? "
+                        "If the patient wants to cancel, acknowledge cancellation briefly."
+                    )
+                else:
+                    instr = (
+                        "Die Antwort des Patienten war unklar. Frage ihn erneut höflich, "
+                        "ob er den Termin bestätigen möchte."
+                        if self._lang == "de" else
+                        "The patient's response was unclear. Politely ask again whether they "
+                        "want to confirm the appointment."
+                    )
+                chat_ctx.items.append(ChatMessage(role="system", content=[instr]))
 
-        if self._booking.step == "awaiting_cancel_or_change":
-            if _is_cancel_intent(user_text, self._lang):
-                await self._publish_cancelled_state()
-                self._booking = BookingState()
-                instr = (
-                    "Der Patient möchte die Buchung abbrechen. Bestätige kurz den Abbruch "
-                    "und biete an, später eine neue Buchung zu starten."
-                    if self._lang == "de" else
-                    "The patient wants to cancel the booking. Briefly confirm cancellation "
-                    "and offer to start a new booking later."
-                )
-            else:
-                instr = (
-                    "Der Patient möchte die Buchung nicht abbrechen. Frage, welches Feld geändert werden soll "
-                    "(Service, Arzt, Termin oder Name), und gehe dann zum passenden Schritt zurück."
-                    if self._lang == "de" else
-                    "The patient does not want to cancel. Ask which field should be changed "
-                    "(service, doctor, slot, or name), then return to the appropriate step."
-                )
-            turn_ctx.add_message(role="system", content=instr)
-            return
+            elif self._booking.step == "awaiting_cancel_or_change":
+                if _is_cancel_intent(user_text, self._lang):
+                    await self._publish_cancelled_state()
+                    self._booking = BookingState()
+                    instr = (
+                        "Der Patient möchte die Buchung abbrechen. Bestätige kurz den Abbruch "
+                        "und biete an, später eine neue Buchung zu starten."
+                        if self._lang == "de" else
+                        "The patient wants to cancel the booking. Briefly confirm cancellation "
+                        "and offer to start a new booking later."
+                    )
+                else:
+                    instr = (
+                        "Der Patient möchte die Buchung nicht abbrechen. Frage, welches Feld geändert werden soll "
+                        "(Service, Arzt, Termin oder Name), und gehe dann zum passenden Schritt zurück."
+                        if self._lang == "de" else
+                        "The patient does not want to cancel. Ask which field should be changed "
+                        "(service, doctor, slot, or name), then return to the appropriate step."
+                    )
+                chat_ctx.items.append(ChatMessage(role="system", content=[instr]))
 
-        # ── MODE SWITCHING LOGIC (MUST COME BEFORE MODE CHECKS) ──
-        # Detect if user is asking a general question (not related to booking)
-        general_question_keywords = [
-            "what", "who", "where", "when", "why", "how", "tell me", "explain",
-            "was", "wer", "wo", "wann", "warum", "wie", "erklären", "was ist",
-            "who is", "what is", "ceo", "owner", "founder", "history", "location",
-            "hours", "open", "close", "price", "cost", "fee", "insurance",
-            "services", "leistungen", "öffnungszeiten", "adresse", "service"
-        ]
-        
-        is_general_question = any(kw in user_text.lower() for kw in general_question_keywords)
-        is_booking_intent = self._is_booking_intent(user_text)
-        
-        # If it's a general question and we're in booking mode but not in active booking flow
-        if is_general_question and self.mode == "booking" and self._booking.step == "idle":
-            log.info("[MODE] Switching from booking to RAG for general question")
-            self._mode = "rag"
-            await self._publish_mode_change("rag")
-            # Add a system message to explain the mode switch
-            switch_msg = (
-                "Note: The user is asking a general clinic question. Switching to answering mode."
-                if self._lang == "en" else
-                "Hinweis: Der Benutzer stellt eine allgemeine Klinikfrage. Wechsle in den Antwortmodus."
-            )
-            turn_ctx.add_message(role="system", content=switch_msg)
-        
-        # If it's a booking intent and we're in RAG mode
-        if is_booking_intent and self.mode == "rag":
-            log.info("[MODE] Switching from RAG to booking for booking intent")
-            self._mode = "booking"
-            await self._publish_mode_change("booking")
-            # Add a system message to explain the mode switch
-            switch_msg = (
-                "Note: The user wants to book an appointment. Switching to booking mode."
-                if self._lang == "en" else
-                "Hinweis: Der Benutzer möchte einen Termin buchen. Wechsle in den Buchungsmodus."
-            )
-            turn_ctx.add_message(role="system", content=switch_msg)
+            # ── RAG mode: handle questions ──────────────────────────
+            elif self.mode == "rag" and self._booking.step in ("idle", "done"):
+                context = await retrieve_context(user_text, top_k=5)
+                if context:
+                    combined = f"{context}\n\nPatient question: {user_text}"
+                    if hasattr(last_user_msg, "content"):
+                        if isinstance(last_user_msg.content, list):
+                            last_user_msg.content = [combined]
+                        else:
+                            last_user_msg.content = combined
+                    log.info("[RAG] Injected %d chars of context for query: %r", len(context), user_text[:60])
+                else:
+                    log.warning("[RAG] No context retrieved — LLM will answer from its own knowledge for: %r", user_text[:60])
 
-        # ── Booking mode: handle booking flow ───────────────────
-        if self.mode == "booking":
-            # Don't do RAG in booking mode - let the LLM handle booking
-            return
-
-        # ── RAG mode: handle questions ──────────────────────────
-        # Skip RAG if we're in the middle of a booking
-        if self._booking.step not in ("idle", "done"):
-            log.info("[RAG] Skipping retrieval — booking in progress (step=%s)", self._booking.step)
-            return
-
-        # ── Retrieve and inject context ────────────────────────
-        context = await retrieve_context(user_text, top_k=5)
-        if context:
-            combined = f"{context}\n\nPatient question: {user_text}"
-            if hasattr(new_message, "content"):
-                new_message.content = combined
-            if hasattr(new_message, "text_content"):
-                new_message.text_content = combined
-            log.info("[RAG] Injected %d chars of context for query: %r", len(context), user_text[:60])
-        else:
-            log.warning(
-                "[RAG] No context retrieved — LLM will answer from its own knowledge for: %r",
-                user_text[:60],
-            )
+        async for chunk in Agent.default.llm_node(self, chat_ctx, tools, model_settings):
+            yield chunk
 
     # ── Booking tools ─────────────────────────────────────────
 
@@ -890,11 +846,6 @@ class FunctiomedAgent(Agent):
                 log.error("[STATE] Failed to publish done state: %s", e)
 
             self._booking = BookingState()
-            
-            # Reset mode to RAG after booking is complete
-            self._mode = "rag"
-            await self._publish_mode_change("rag")
-            log.info("[MODE] Booking completed, switching back to RAG mode")
 
             log.info(
                 "[TIMER][booking] confirm_booking total %.1fms (confirmation=%s)",
