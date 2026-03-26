@@ -54,20 +54,64 @@ from urllib.parse import urlencode
 _orig_to_deepgram_url = dg_utils._to_deepgram_url
 def _patched_to_deepgram_url(opts: dict, base_url: str, *, websocket: bool) -> str:
     url = _orig_to_deepgram_url(opts, base_url, websocket=websocket)
-    replacements = []
     words = ["zero", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine"]
+    parts = []
     for i in range(10):
-        replacements.append(("replace", f"triple {i}:{i}{i}{i}"))
-        replacements.append(("replace", f"double {i}:{i}{i}"))
-        replacements.append(("replace", f"triple {words[i]}:{i}{i}{i}"))
-        replacements.append(("replace", f"double {words[i]}:{i}{i}"))
-    extra_qs = urlencode(replacements)
+        # Use literal colon (not %3A) — Deepgram needs it as separator.
+        # Encode spaces as '+' for query-string safety.
+        for val in (
+            f"triple {i}:{i}{i}{i}",
+            f"double {i}:{i}{i}",
+            f"triple {words[i]}:{i}{i}{i}",
+            f"double {words[i]}:{i}{i}",
+        ):
+            parts.append("replace=" + val.replace(" ", "+"))
+    extra_qs = "&".join(parts)
     return url + ("&" if "?" in url else "?") + extra_qs
 
 dg_utils._to_deepgram_url = _patched_to_deepgram_url
 # -----------------------------------------------------------
 
 log = logging.getLogger(__name__)
+
+# ─────────────────────────────────────────────────────────────
+# Spoken-number normalizer (shared by RAG + booking paths)
+# ─────────────────────────────────────────────────────────────
+
+_SPOKEN_DIGIT_MAP: dict[str, str] = {
+    "zero": "0", "oh": "0",
+    "one": "1", "two": "2", "three": "3", "four": "4",
+    "five": "5", "six": "6", "seven": "7", "eight": "8", "nine": "9",
+}
+
+def _normalize_spoken_numbers(text: str) -> str:
+    """Expand spoken multiplier patterns into digit strings.
+
+    Examples:
+      'triple 5'    → '555'
+      'double one'  → '11'
+      'triple five' → '555'
+      'double 2'    → '22'
+    Works whether Deepgram's replace feature fired or not.
+    """
+    digit_alts = "|".join(_SPOKEN_DIGIT_MAP.keys())
+    single_dig = rf"(?:{digit_alts}|\d)"
+
+    def _expand(m: re.Match, times: int) -> str:
+        raw = m.group(1).lower()
+        return _SPOKEN_DIGIT_MAP.get(raw, raw) * times
+
+    text = re.sub(
+        rf"\btriple\s+({single_dig})\b",
+        lambda m: _expand(m, 3),
+        text, flags=re.IGNORECASE,
+    )
+    text = re.sub(
+        rf"\bdouble\s+({single_dig})\b",
+        lambda m: _expand(m, 2),
+        text, flags=re.IGNORECASE,
+    )
+    return text
 
 # ─────────────────────────────────────────────────────────────
 # Affirmative / negative keyword sets (voice-safe)
@@ -388,7 +432,18 @@ class FunctiomedAgent(Agent):
             last_user_msg._intercepted = True  # Prevent re-intercepting on tool callbacks
             user_text = last_user_msg.text_content or getattr(last_user_msg, "content", "")
             if isinstance(user_text, list): user_text = str(user_text)
-            
+
+            # ── Normalise spoken number patterns (triple 5→555, double 1→11) ──
+            _raw_text = user_text
+            user_text = _normalize_spoken_numbers(user_text)
+            if user_text != _raw_text:
+                log.info("[NORMALIZE] %r → %r", _raw_text[:80], user_text[:80])
+                if hasattr(last_user_msg, "content"):
+                    if isinstance(last_user_msg.content, list):
+                        last_user_msg.content = [user_text]
+                    else:
+                        last_user_msg.content = user_text
+
             log.info(f"[DEBUG] Agent mode: {self.mode}, Booking step: {self._booking.step}")
             log.info(f"[DEBUG] User said: {user_text[:100]}")
 
