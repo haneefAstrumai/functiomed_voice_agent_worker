@@ -273,6 +273,7 @@ Rules:
 - For booking, confirm each step before moving to the next.
 - When calling confirm_slot, always pass the exact slot_id UUID string from the get_slots list.
 - Never lowercase or paraphrase service or doctor names — use them exactly as provided.
+- AMBIGUITY: If the user provides a service or doctor name that is ambiguous (e.g., 'Haneef' when 'Dr Haneef Ullah' and 'Dr Syed Haneef' are available), you MUST ask the user for clarification. Do NOT automatically select one.
 """
 
 # ── Booking state ─────────────────────────────────────────────
@@ -329,19 +330,43 @@ class FunctiomedAgent(Agent):
         s = re.sub(r"\s+", " ", s).strip()
         return s
 
-    def _best_match(self, query: str, choices: list[str]) -> tuple[str | None, float]:
+    def _get_ranked_matches(self, query: str, choices: list[str]) -> list[tuple[str, float]]:
         q = self._norm(query)
         if not q or not choices:
-            return None, 0.0
-        best = (None, 0.0)
+            return []
+        
+        results = []
         for c in choices:
             c_norm = self._norm(c)
             if not c_norm:
                 continue
+            
+            # Base fuzzy score
             score = SequenceMatcher(None, q, c_norm).ratio()
-            if score > best[1]:
-                best = (c, score)
-        return best
+            
+            # Substring boost: if the query is a whole word or significant part
+            # This helps cases like 'Haneef' matching 'Dr Haneef Ullah'
+            if q in c_norm:
+                words = c_norm.split()
+                if q in words:
+                    # Perfect word match gets a high floor
+                    score = max(score, 0.85)
+                else:
+                    # Partial substring match gets a good floor
+                    score = max(score, 0.75)
+            
+            results.append((c, score))
+            
+        # Sort by score descending
+        results.sort(key=lambda x: x[1], reverse=True)
+        return results
+
+    def _best_match(self, query: str, choices: list[str]) -> tuple[str | None, float]:
+        """Legacy wrapper for single best match."""
+        matches = self._get_ranked_matches(query, choices)
+        if not matches:
+            return None, 0.0
+        return matches[0]
 
     async def _publish_state(self, ctx: RunContext, available: list | None = None) -> None:
         b = self._booking
@@ -477,6 +502,45 @@ class FunctiomedAgent(Agent):
                     )
                 chat_ctx.items.append(ChatMessage(role="system", content=[instr]))
 
+            # ── Ambiguity intercept (Doctor) ──────────────────────
+            elif self.mode == "booking" and self._booking.step == "collect_doctor" and self._booking._doctors:
+                choices = []
+                for d in self._booking._doctors:
+                    title = (d.get("title") or "").strip()
+                    full  = (d.get("full_name") or "").strip()
+                    display = f"{title} {full}".strip() if title else full
+                    choices.append(display)
+                
+                matches = self._get_ranked_matches(user_text, choices)
+                # If multiple matches are found with good scores (>= 0.72)
+                ambiguous = [name for name, s in matches if s >= 0.72]
+                if len(ambiguous) > 1:
+                    log.info("[INTERCEPT] Doctor ambiguity detected for %r: %s", user_text, ambiguous)
+                    instr = (
+                        f"Der Patient hat '{user_text}' gesagt. Dies ist mehrdeutig zwischen {', '.join(ambiguous)}. "
+                        "Frage den Patienten bitte höflich, welchen dieser Ärzte er meint. Wähle NICHT selbst einen aus."
+                        if self._lang == "de" else
+                        f"The patient said '{user_text}'. This is ambiguous between {', '.join(ambiguous)}. "
+                        "Please politely ask the patient which of these doctors they mean. Do NOT select one yourself."
+                    )
+                    chat_ctx.items.append(ChatMessage(role="system", content=[instr]))
+
+            # ── Ambiguity intercept (Service) ─────────────────────
+            elif self.mode == "booking" and self._booking.step == "collect_service" and self._booking._services:
+                choices = [s.get("name", "").strip() for s in self._booking._services if s.get("name")]
+                matches = self._get_ranked_matches(user_text, choices)
+                ambiguous = [name for name, s in matches if s >= 0.72]
+                if len(ambiguous) > 1:
+                    log.info("[INTERCEPT] Service ambiguity detected for %r: %s", user_text, ambiguous)
+                    instr = (
+                        f"Der Patient hat '{user_text}' gesagt. Dies ist mehrdeutig zwischen {', '.join(ambiguous)}. "
+                        "Frage den Patienten bitte, welchen Dienst er meint."
+                        if self._lang == "de" else
+                        f"The patient said '{user_text}'. This is ambiguous between {', '.join(ambiguous)}. "
+                        "Please ask the patient which service they mean."
+                    )
+                    chat_ctx.items.append(ChatMessage(role="system", content=[instr]))
+
             elif self._booking.step == "awaiting_cancel_or_change":
                 if _is_cancel_intent(user_text, self._lang):
                     await self._publish_cancelled_state()
@@ -566,13 +630,30 @@ class FunctiomedAgent(Agent):
         if direct:
             exact_name = direct
         else:
-            best, score = self._best_match(service_name, choices)
-            log.info("[CONFIRM_SERVICE] best_match=%r score=%.3f", best, score)
+            matches = self._get_ranked_matches(service_name, choices)
+            log.info("[CONFIRM_SERVICE] found %d matches", len(matches))
+            
+            if not matches:
+                best, score = None, 0.0
+            else:
+                best, score = matches[0]
+
+            # Check for ambiguity if we have multiple good matches
+            ambiguous = [name for name, s in matches if s >= 0.72 and (score - s) < 0.1]
+            
+            if len(ambiguous) > 1:
+                log.info("[CONFIRM_SERVICE] Ambiguity detected: %s", ambiguous)
+                self._booking.step = "collect_service"
+                await self._publish_state(context, available=choices)
+                if self._lang == "de":
+                    return f"Ich habe mehrere Dienste gefunden, die zu '{service_name}' passen könnten: {', '.join(ambiguous)}. Welchen meinten Sie?"
+                return f"I found multiple services that could match '{service_name}': {', '.join(ambiguous)}. Which one did you mean?"
+
             if best and score >= 0.72:
                 exact_name = best
             else:
                 self._booking.step = "collect_service"
-                await self._publish_state(context, available=choices[:10])
+                await self._publish_state(context, available=choices)
                 log.warning("[CONFIRM_SERVICE] no match for %r — re-asking", service_name)
                 if self._lang == "de":
                     return (
@@ -640,6 +721,7 @@ class FunctiomedAgent(Agent):
             lines.append(display)
         log.info("[GET_DOCTORS] returning %d doctors: %s", len(lines), lines)
         log.info("[TIMER][booking] get_doctors %.1fms (count=%d)", dt_ms, len(lines))
+        self._booking.step = "collect_doctor"  # ← ensure step is set for llm_node intercept
         await self._publish_state(context, available=lines)
         return f"Available doctors: {', '.join(lines)}"
 
@@ -664,26 +746,48 @@ class FunctiomedAgent(Agent):
             display = f"{title} {full}".strip() if title else full
             choices.append(display)
 
-        log.info("[CONFIRM_DOCTOR] choices=%s", choices)
+        log.info("[CONFIRM_DOCTOR] parsed_choices=%s", choices)
 
-        best, score = self._best_match(doctor_name, choices)
-        log.info("[CONFIRM_DOCTOR] best_match=%r score=%.3f", best, score)
-
-        if best and score >= 0.72:
-            display_name = best
+        # 1. Direct match check
+        direct = next((c for c in choices if self._norm(c) == self._norm(doctor_name)), None)
+        if direct:
+            display_name = direct
         else:
-            self._booking.step = "collect_doctor"
-            await self._publish_state(context, available=choices[:10])
-            log.warning("[CONFIRM_DOCTOR] no match for %r — re-asking", doctor_name)
-            if self._lang == "de":
+            # 2. Ranked match check
+            matches = self._get_ranked_matches(doctor_name, choices)
+            log.info("[CONFIRM_DOCTOR] found %d matches", len(matches))
+            
+            if not matches:
+                best, score = None, 0.0
+            else:
+                best, score = matches[0]
+
+            # 3. Check for ambiguity
+            ambiguous = [name for name, s in matches if s >= 0.72 and (score - s) < 0.1]
+            
+            if len(ambiguous) > 1:
+                log.info("[CONFIRM_DOCTOR] Ambiguity detected: %s", ambiguous)
+                self._booking.step = "collect_doctor"
+                await self._publish_state(context, available=choices)
+                if self._lang == "de":
+                    return f"Ich habe mehrere Ärzte gefunden, die zu '{doctor_name}' passen könnten: {', '.join(ambiguous)}. Welchen meinten Sie?"
+                return f"I found multiple doctors that could match '{doctor_name}': {', '.join(ambiguous)}. Which one did you mean?"
+
+            if best and score >= 0.72:
+                display_name = best
+            else:
+                self._booking.step = "collect_doctor"
+                await self._publish_state(context, available=choices)
+                log.warning("[CONFIRM_DOCTOR] no match for %r — re-asking", doctor_name)
+                if self._lang == "de":
+                    return (
+                        f"Ich habe verstanden: {doctor_name}. "
+                        "Könnten Sie den Namen des Arztes wiederholen oder aus den Optionen in der Seitenleiste wählen?"
+                    )
                 return (
-                    f"Ich habe verstanden: {doctor_name}. "
-                    "Könnten Sie den Namen des Arztes wiederholen oder aus den Optionen in der Seitenleiste wählen?"
+                    f"I heard: {doctor_name}. "
+                    "Could you repeat the doctor name, or choose from the options in the sidebar?"
                 )
-            return (
-                f"I heard: {doctor_name}. "
-                "Could you repeat the doctor name, or choose from the options in the sidebar?"
-            )
 
         self._booking.doctor = display_name
         self._booking.step   = "doctor"
@@ -750,6 +854,7 @@ class FunctiomedAgent(Agent):
             return "No available slots at this time. Please call the clinic directly."
 
         self._booking._slots = slots
+        self._booking.step   = "collect_slot"  # ← ensure step is set
         lines = []
         for i, s in enumerate(slots[:5], 1):
             lines.append(f"{i}. {s['slot_date']} at {s['slot_time']} — slot_id: {s['id']}")
